@@ -1,91 +1,122 @@
-# Material You CESHRC
+# IMGika - 图片隐写工具
 
-基于 React 和 TypeScript 构建的个人网站。此示例为单页应用，专注于视觉设计，包括深色/浅色模式切换和动态背景效果。当然，你也可以套用Design来修改成您想要的任意网站类型。
+IMGika 是一个基于 Web 的前端工具，可以在浏览器中将任何文件隐藏在图片的 Alpha 通道中，实现隐写术的功能。所有处理都在本地完成，确保您的数据隐私和安全。
 
-> No.A0001
-> Powered by CESHRC
+## 功能特点
 
-## Demo
+* **隐写功能**: 将任意文件隐藏在图片的 Alpha 通道中
+* **完全本地处理**: 所有操作都在浏览器中完成，无需上传文件到服务器
+* **无损图片质量**: 使用 PNG 格式保证图片质量不受影响
+* **安全可靠**: 数据不会离开您的设备，保障隐私安全
+* **Material You 设计**: 采用现代化的 Material Design 3 设计语言
+* **深色/浅色模式**: 自动适配系统主题或手动切换
+* **响应式设计**: 适配各种屏幕尺寸和设备
 
-[Chongxi's Homepage](https://chongxi.us)
+## 技术栈
 
-## feature
+* **前端框架**: React (v19.2.0)
+* **语言**: TypeScript (v5.9.3)
+* **构建工具**: Vite (v7.2.4)
+* **样式**: Tailwind CSS
+* **动画**: CSS 和自定义动画效果
+* **图像处理**: Canvas API
 
-*   **profile**: `Hero` 部分和 `ProfileCard` 展示个人简介和核心信息
-*   **repo**: `ProjectGrid` 以网格布局展示个人项目
-*   **view**: `ActivitySection` 显示最近动态
-*   **link**: `ConnectGrid` 和 `PersonalLinks` 提供社交链接
-*   **interaction**:  `ScrollReveal` 实现滚动时内容动画
-*   **switch**: 支持深色/浅色模式
-*   **background**: Pixel开机向导高仿背景
-
-## tech
-
-*   **前端**: React (v19.2.0)
-*   **使用**: TypeScript (v5.9.3)
-*   **构建**: Vite (v7.2.4)
-*   **样式**: Tailwind CSS
-*   **动画**: CSS 和 `ScrollReveal`
-
-## structure
+## 项目结构
 
 ```
 .
-├───App.tsx                 # 应用主入口，~~搞半天原来能自动拼~~
-├───config.ts               # 主配置
-├───index.css               # 全局
-├───index.html              # HTML 模板
-├───index.tsx               # React 渲染入口
-├───package.json            # 依赖和脚本
-├───pnpm-lock.yaml          # pnpm lock
-├───tailwind.config.js      # Tailwind CSS 配置
-├───tsconfig.json           # TypeScript 配置
-├───vite.config.ts          # Vite 配置
-└───components/             # UI 组件目录
-    ├───ActivitySection.tsx # 动态
-    ├───ConnectGrid.tsx     # 联系方式
-    ├───Dashboard.tsx       # 仪表盘
-    ├───ExpandingButton.tsx # 可扩展按钮
-    ├───FloatingActionButton.tsx # 浮动操作按钮
-    ├───Footer.tsx          # 页脚
-    ├───Hero.tsx            # 介绍
-    ├───Navbar.tsx          # 导航栏
-    ├───PersonalLinks.tsx   # 个人链接
-    ├───ProfileCard.tsx     # 个人资料
-    ├───ProfileDossier.tsx  # 详细个人资料(目前未启用)
-    ├───ProjectGrid.tsx     # 项目网格
-    ├───ScrollReveal.tsx    # 滚动动画
-    └───useClickOutside.tsx # 点击外部 Hook
+├── App.tsx                 # 应用主入口
+├── config.ts               # 全局配置文件
+├── index.css               # 全局样式
+├── index.html              # HTML 模板
+├── index.tsx               # React 渲染入口
+├── package.json            # 依赖和脚本配置
+├── pnpm-lock.yaml          # pnpm 锁定文件
+├── tailwind.config.js      # Tailwind CSS 配置
+├── tsconfig.json           # TypeScript 配置
+├── vite.config.ts          # Vite 配置
+├── components/             # UI 组件目录
+│   ├── Footer.tsx          # 页脚组件
+│   ├── Hero.tsx            # 主页头部介绍组件
+│   ├── HowItWorksSection.tsx # 工作原理说明组件
+│   ├── ImgikaTool.tsx      # 核心隐写工具组件
+│   └── ScrollReveal.tsx    # 滚动动画组件
+└── public/                 # 静态资源目录
+    └── favicon.ico         # 网站图标
 ```
 
-## Setup
+## 核心组件说明
 
-### 1. Fork 此仓库并 clone 到您的设备
+### Hero 组件
+展示 IMGika 工具的介绍信息和核心特性，包括：
+- 工具名称和描述
+- 核心功能点（隐私保护、无损质量、安全可靠）
+- 视觉展示区域
+
+### ImgikaTool 组件
+这是应用的核心功能组件，提供编码和解码功能：
+- **编码模式**: 将文件隐藏在图片中
+- **解码模式**: 从处理后的图片中提取原始文件
+- 文件上传和处理流程
+- 进度显示和结果展示
+
+### HowItWorksSection 组件
+以可视化方式展示工具的工作流程：
+1. 上传文件（选择图片和需要隐藏的文件）
+2. 编码处理（将文件数据隐藏在图片的 Alpha 通道中）
+3. 下载结果（保存包含隐藏数据的图片）
+4. 解码提取（从图片中恢复原始文件）
+
+## 工作原理
+
+IMGika 使用图片的 Alpha 通道来存储二进制数据：
+
+1. **编码过程**:
+   - 用户上传一张图片和一个需要隐藏的文件
+   - 工具计算文件的 SHA256 校验和
+   - 创建包含文件信息的头部数据（文件大小、原始宽度、SHA256）
+   - 将头部数据和文件内容依次写入图片像素的 Alpha 通道
+   - 生成并下载包含隐藏数据的新图片
+
+2. **解码过程**:
+   - 用户上传经过编码处理的图片
+   - 工具读取图片 Alpha 通道中的数据
+   - 解析头部信息获取文件大小和校验和
+   - 提取文件数据并验证完整性
+   - 提供原始文件下载
+
+## 安装和运行
+
+### 1. 克隆项目
+
+```bash
+git clone <repository-url>
+cd IMGikaWeb
+```
 
 ### 2. 安装依赖
 
-推荐使用 `pnpm`
-~~npm最大的用处是安装pnpm~~
+推荐使用 `pnpm`:
 
 ```bash
 pnpm install
 ```
 
-或者使用 `npm`
+或者使用 `npm`:
 
 ```bash
 npm install
 ```
 
-### 3. server
+### 3. 启动开发服务器
 
 ```bash
 pnpm dev
 ```
 
-这将在本地启动一个开发服务器，`http://localhost:5173`
+这将在本地启动一个开发服务器，通常在 `http://localhost:5173`
 
-### 4. build
+### 4. 构建生产版本
 
 ```bash
 pnpm build
@@ -93,7 +124,7 @@ pnpm build
 
 这会将应用程序构建到 `dist` 目录中，用于生产部署
 
-### 5. preview
+### 5. 预览生产版本
 
 ```bash
 pnpm preview
@@ -101,66 +132,16 @@ pnpm preview
 
 这会在本地启动一个服务器，用于预览构建好的生产版本
 
-## 部署到 Cloudflare Pages
+## 部署
 
-此项目可以轻松部署到 Cloudflare Pages。请按照以下步骤操作：
+此项目可以轻松部署到任何支持静态文件托管的服务，如：
+- Vercel
+- Netlify
+- GitHub Pages
+- Cloudflare Pages
 
-1.  保证此项目已正确放置在 GitHub repo
-2.  登录到您的 Cloudflare 帐户，导航到 Pages
-3.  选择“创建项目”并连接您的 Git 仓库
-4.  在配置构建设置时，使用以下配置：
-    *   **构建命令**: `npm run build` (如果您使用 pnpm，也可以是 `pnpm build`)
-    *   **构建输出目录**: `dist`
-5.  点击“部署站点”。Cloudflare Pages 将会自动构建并部署
-
-## 爆改指南
-
-本项目高度模块化，旨在帮助开发者快速上手定制
-### 1. 项目结构和核心组件
-
-*   **`components/` 目录**: 这是存放所有 UI 组件的地方。每个文件都代表一个独立的、可复用的模块
-*   **`App.tsx`**: 这是应用程序的根组件，负责组合 `components/` 目录中的各个模块来构建完整的页面布局
-*   **`index.tsx`**: React 应用程序的入口文件，负责将 `App` 组件渲染到 HTML 页面中
-*   **`config.ts`**: 全局配置或常量会放置在此处
-
-### 2. 内容修改与替换
-
-大多数文本和图片内容都直接在相应的组件文件中定义
-
-*   **组件文本**: 直接编辑组件文件中的 JSX 代码，修改其中的标题、段落、按钮文本等
-*   **图片/媒体**: 替换组件中引用的图片路径或 URL
-
-### 3. 定制
-
-本项目使用了 Tailwind CSS 和自定义 CSS 变量来实现样式和主题
-
-*   **Tailwind CSS**:
-    *   直接在 JSX 元素的 `className` 属性中使用 Tailwind CSS 提供的实用程序类来快速修改样式。例如，更改 `text-xl` 为 `text-2xl` 可以改变字体大小
-    *   如果需要自定义 Tailwind 配置，可以修改 `tailwind.config.js` 文件
-*   **主题变量**:
-    *   `index.html` 中定义了基于 Material Design 3 的 CSS 变量（如 `--md-sys-color-primary`）。通过修改这些变量的值，可以全局改变网站的颜色主题
-    *   `[data-theme="dark"]` 选择器下的变量用于深色模式
-*   **自定义 CSS**:
-    *   `index.css` 文件可以用于添加全局的自定义 CSS 规则或覆盖 Tailwind 的默认样式
-    *   组件内部的自定义样式可以直接写在组件文件中，或者通过导入单独的 CSS 模块
-
-### 4. 结构
-
-*   **改造 `App.tsx`**:
-    *   您可以根据需求彻底重构 `App.tsx`，添加、删除或重新排列组件，以构建全新的页面布局。例如，可以引入 `react-router-dom` 来实现多页面应用，定义复杂的路由结构，将单页应用转变为多功能门户
-*   **新建组件模块**:
-    *   在 `components/` 目录下创建全新的 `.tsx` 文件来构建您自己的定制 UI 模块。这些新组件可以集成到任何现有布局中，或构成全新的界面元素
-    
+构建完成后，只需将 `dist` 目录中的文件部署到您的托管服务即可。
 
 ## 许可证
 
-本项目采用 **知识共享署名 4.0 国际公共许可协议 (CC BY 4.0)** 进行许可。这意味着您可以自由地共享（复制和传播）以及演绎（修改和基于本项目进行创作），甚至出于商业目的
-
-**署名要求：**
-在使用或分发本项目（或其修改版本）时，您必须给出适当的署名，例如：
-
-*   指出本网站模板/主题来源于 CESHRC(https://github.com/ChongxiSama/CESHRC-A001)
-*   提供指向许可协议的链接：`https://creativecommons.org/licenses/by/4.0/`
-*   指明是否作了修改。
-
-您必须以任何合理的方式这样做，但不得以任何方式暗示许可人（即您本人）认可您或您的使用
+本项目采用 MIT 许可证进行许可。详情请见 [LICENSE](./LICENSE) 文件。
