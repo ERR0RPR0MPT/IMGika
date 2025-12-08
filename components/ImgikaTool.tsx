@@ -76,12 +76,12 @@ async function encodeImage(imageData, imgWidth, imgHeight, fileData, imageFilena
   let finalWidth = Math.max(1, Math.ceil(finalHeight * aspectRatio));
   
   // 确保是整数
-  finalWidth = Math. floor(finalWidth);
+  finalWidth = Math.floor(finalWidth);
   finalHeight = Math.floor(finalHeight);
   
   while (finalWidth * finalHeight < totalBytesNeeded) {
     finalHeight++;
-    finalWidth = Math. max(1, Math.floor(Math.ceil(finalHeight * aspectRatio)));
+    finalWidth = Math.max(1, Math.floor(Math.ceil(finalHeight * aspectRatio)));
   }
   
   // 如果原图已经足够大，使用原图尺寸
@@ -207,7 +207,7 @@ async function decodeImage(imageData) {
   
   const ctx = canvas.getContext('2d');
   if (!ctx) {
-    imageBitmap. close();
+    imageBitmap.close();
     throw new Error('Failed to get 2d context');
   }
   
@@ -234,7 +234,7 @@ async function decodeImage(imageData) {
   self.postMessage({ type: 'progress', progress: 35 });
   
   // 解析header
-  const headerView = new DataView(headerBytes. buffer);
+  const headerView = new DataView(headerBytes.buffer);
   const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
   const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
   const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
@@ -312,7 +312,7 @@ async function decodeImage(imageData) {
   
   // 设置Alpha为255
   const originalImageData = originalCtx.getImageData(0, 0, safeOriginalWidth, originalHeight);
-  const originalPixels = originalImageData. data;
+  const originalPixels = originalImageData.data;
   
   for (let i = 0; i < originalPixels.length; i += 4) {
     originalPixels[i + 3] = 255;
@@ -321,7 +321,7 @@ async function decodeImage(imageData) {
   originalCtx.putImageData(originalImageData, 0, 0);
   
   const originalBlob = await originalCanvas.convertToBlob({ type: 'image/png' });
-  const originalArrayBuffer = await originalBlob. arrayBuffer();
+  const originalArrayBuffer = await originalBlob.arrayBuffer();
   
   self.postMessage({ type: 'progress', progress: 100 });
   
@@ -329,7 +329,7 @@ async function decodeImage(imageData) {
   let outputImageFilename = originalImageFilename;
   const lastDotIndex = outputImageFilename.lastIndexOf('.');
   if (lastDotIndex > 0) {
-    outputImageFilename = outputImageFilename. substring(0, lastDotIndex) + '. png';
+    outputImageFilename = outputImageFilename.substring(0, lastDotIndex) + '.png';
   } else {
     outputImageFilename = outputImageFilename + '.png';
   }
@@ -360,7 +360,7 @@ self.onmessage = async (e) => {
         payload.imageFilename,
         payload.dataFilename
       );
-      self.postMessage({ type: 'encodeResult', result }, [result.data. buffer]);
+      self.postMessage({ type: 'encodeResult', result }, [result.data.buffer]);
     } else if (type === 'decode') {
       const result = await decodeImage(payload.imageData);
       self.postMessage({ 
@@ -374,6 +374,262 @@ self.onmessage = async (e) => {
 };
 `;
 
+// 文件类型检测工具
+const getFileExtension = (filename: string): string => {
+  const lastDot = filename.lastIndexOf('.');
+  if (lastDot === -1) return '';
+  return filename.substring(lastDot + 1).toLowerCase();
+};
+
+// 判断文件类型
+type PreviewType = 'image' | 'video' | 'audio' | 'text' | 'code' | 'pdf' | 'none';
+
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico'];
+const VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv'];
+const AUDIO_EXTENSIONS = ['mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a'];
+const TEXT_EXTENSIONS = ['txt', 'md', 'markdown', 'log', 'csv', 'ini', 'cfg', 'conf'];
+const CODE_EXTENSIONS = [
+  'js', 'jsx', 'ts', 'tsx', 'json', 'html', 'htm', 'css', 'scss', 'sass', 'less',
+  'py', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php',
+  'swift', 'kt', 'kts', 'scala', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd',
+  'sql', 'xml', 'yaml', 'yml', 'toml', 'env', 'gitignore', 'dockerfile',
+  'makefile', 'cmake', 'gradle', 'vue', 'svelte', 'astro'
+];
+const PDF_EXTENSIONS = ['pdf'];
+
+const getPreviewType = (filename: string): PreviewType => {
+  const ext = getFileExtension(filename);
+  if (IMAGE_EXTENSIONS.includes(ext)) return 'image';
+  if (VIDEO_EXTENSIONS.includes(ext)) return 'video';
+  if (AUDIO_EXTENSIONS.includes(ext)) return 'audio';
+  if (TEXT_EXTENSIONS.includes(ext)) return 'text';
+  if (CODE_EXTENSIONS.includes(ext)) return 'code';
+  if (PDF_EXTENSIONS.includes(ext)) return 'pdf';
+  return 'none';
+};
+
+const getMimeType = (filename: string): string => {
+  const ext = getFileExtension(filename);
+  const mimeTypes: Record<string, string> = {
+    // Images
+    'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+    'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp',
+    'svg': 'image/svg+xml', 'ico': 'image/x-icon',
+    // Videos
+    'mp4': 'video/mp4', 'webm': 'video/webm', 'ogg': 'video/ogg',
+    'mov': 'video/quicktime', 'avi': 'video/x-msvideo', 'mkv': 'video/x-matroska',
+    // Audio
+    'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'flac': 'audio/flac',
+    'aac': 'audio/aac', 'm4a': 'audio/mp4',
+    // PDF
+    'pdf': 'application/pdf',
+    // Text/Code
+    'txt': 'text/plain', 'md': 'text/markdown', 'json': 'application/json',
+    'html': 'text/html', 'css': 'text/css', 'js': 'text/javascript',
+    'xml': 'text/xml', 'csv': 'text/csv',
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+};
+
+// 代码语言映射
+const getCodeLanguage = (filename: string): string => {
+  const ext = getFileExtension(filename);
+  const langMap: Record<string, string> = {
+    'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
+    'py': 'python', 'java': 'java', 'c': 'c', 'cpp': 'cpp', 'h': 'c', 'hpp': 'cpp',
+    'cs': 'csharp', 'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
+    'swift': 'swift', 'kt': 'kotlin', 'scala': 'scala', 'sh': 'bash', 'bash': 'bash',
+    'sql': 'sql', 'html': 'html', 'htm': 'html', 'css': 'css', 'scss': 'scss',
+    'json': 'json', 'xml': 'xml', 'yaml': 'yaml', 'yml': 'yaml', 'md': 'markdown',
+    'vue': 'vue', 'svelte': 'svelte',
+  };
+  return langMap[ext] || 'plaintext';
+};
+
+// 解码结果接口
+interface DecodeResult {
+  fileData: Uint8Array;
+  originalImageData: Uint8Array;
+  originalDataFilename: string;
+  outputImageFilename: string;
+  fileSize: number;
+  originalWidth: number;
+  originalHeight: number;
+  sha256Match: boolean;
+}
+
+// 预览组件
+interface FilePreviewProps {
+  fileData: Uint8Array;
+  filename: string;
+  onClose: () => void;
+}
+
+const FilePreview: React.FC<FilePreviewProps> = ({ fileData, filename, onClose }) => {
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [textContent, setTextContent] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const previewType = getPreviewType(filename);
+
+  useEffect(() => {
+    setIsLoading(true);
+    
+    if (previewType === 'image' || previewType === 'video' || previewType === 'audio' || previewType === 'pdf') {
+      const blob = new Blob([fileData as BlobPart], { type: getMimeType(filename) });
+      const url = URL.createObjectURL(blob);
+      setPreviewUrl(url);
+      setIsLoading(false);
+      
+      return () => {
+        URL.revokeObjectURL(url);
+      };
+    } else if (previewType === 'text' || previewType === 'code') {
+      // 限制文本预览大小（最大1MB）
+      const maxSize = 1024 * 1024;
+      const dataToRead = fileData.length > maxSize ? fileData.slice(0, maxSize) : fileData;
+      const decoder = new TextDecoder('utf-8');
+      try {
+        let content = decoder.decode(dataToRead);
+        if (fileData.length > maxSize) {
+          content += '\n\n...  (文件过大，仅显示前1MB内容)';
+        }
+        setTextContent(content);
+      } catch {
+        setTextContent('无法解码文本内容');
+      }
+      setIsLoading(false);
+    } else {
+      setIsLoading(false);
+    }
+  }, [fileData, filename, previewType]);
+
+  if (previewType === 'none') {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-[var(--md-sys-color-surface)] rounded-3xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-[var(--md-sys-color-outline-variant)]/20">
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">
+              {previewType === 'image' && '🖼️'}
+              {previewType === 'video' && '🎬'}
+              {previewType === 'audio' && '🎵'}
+              {previewType === 'text' && '📄'}
+              {previewType === 'code' && '💻'}
+              {previewType === 'pdf' && '📑'}
+            </span>
+            <div>
+              <h3 className="text-lg font-semibold text-[var(--md-sys-color-on-surface)]">
+                文件预览
+              </h3>
+              <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] break-all">
+                {filename}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-2 rounded-full hover:bg-[var(--md-sys-color-surface-variant)] transition-colors"
+          >
+            <span className="text-2xl">✕</span>
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-auto p-4">
+          {isLoading ? (
+            <div className="flex items-center justify-center h-64">
+              <span className="text-4xl animate-spin">⟳</span>
+            </div>
+          ) : (
+            <>
+              {/* 图片预览 */}
+              {previewType === 'image' && previewUrl && (
+                <div className="flex items-center justify-center">
+                  <img
+                    src={previewUrl}
+                    alt={filename}
+                    className="max-w-full max-h-[70vh] object-contain rounded-lg"
+                  />
+                </div>
+              )}
+
+              {/* 视频预览 */}
+              {previewType === 'video' && previewUrl && (
+                <div className="flex items-center justify-center">
+                  <video
+                    src={previewUrl}
+                    controls
+                    className="max-w-full max-h-[70vh] rounded-lg"
+                  >
+                    您的浏览器不支持视频播放
+                  </video>
+                </div>
+              )}
+
+              {/* 音频预览 */}
+              {previewType === 'audio' && previewUrl && (
+                <div className="flex items-center justify-center py-8">
+                  <audio src={previewUrl} controls className="w-full max-w-md">
+                    您的浏览器不支持音频播放
+                  </audio>
+                </div>
+              )}
+
+              {/* PDF预览 */}
+              {previewType === 'pdf' && previewUrl && (
+                <div className="h-[70vh]">
+                  <iframe
+                    src={previewUrl}
+                    className="w-full h-full rounded-lg border border-[var(--md-sys-color-outline-variant)]/20"
+                    title={filename}
+                  />
+                </div>
+              )}
+
+              {/* 文本预览 */}
+              {previewType === 'text' && textContent !== null && (
+                <div className="bg-[var(--md-sys-color-surface-variant)] rounded-lg p-4 overflow-auto max-h-[70vh]">
+                  <pre className="text-sm text-[var(--md-sys-color-on-surface)] whitespace-pre-wrap break-words font-mono">
+                    {textContent}
+                  </pre>
+                </div>
+              )}
+
+              {/* 代码预览 */}
+              {previewType === 'code' && textContent !== null && (
+                <div className="bg-[#1e1e1e] rounded-lg overflow-auto max-h-[70vh]">
+                  <div className="flex items-center justify-between px-4 py-2 bg-[#2d2d2d] border-b border-[#3d3d3d]">
+                    <span className="text-xs text-gray-400 font-mono">
+                      {getCodeLanguage(filename)}
+                    </span>
+                  </div>
+                  <pre className="p-4 text-sm text-gray-200 whitespace-pre-wrap break-words font-mono overflow-x-auto">
+                    <code>{textContent}</code>
+                  </pre>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="p-4 border-t border-[var(--md-sys-color-outline-variant)]/20 flex justify-end">
+          <button
+            onClick={onClose}
+            className="px-6 py-2 rounded-full bg-[var(--md-sys-color-primary)] text-[var(--md-sys-color-on-primary)] font-medium hover:shadow-lg transition-shadow"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ImgikaTool: React.FC = () => {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [dataFile, setDataFile] = useState<File | null>(null);
@@ -383,6 +639,10 @@ const ImgikaTool: React.FC = () => {
   const [mode, setMode] = useState<'encode' | 'decode'>('encode');
   const [imageDragActive, setImageDragActive] = useState(false);
   const [dataDragActive, setDataDragActive] = useState(false);
+  
+  // 解码结果状态
+  const [decodeResult, setDecodeResult] = useState<DecodeResult | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
   
   const imageInputRef = useRef<HTMLInputElement>(null);
   const dataInputRef = useRef<HTMLInputElement>(null);
@@ -401,7 +661,7 @@ const ImgikaTool: React.FC = () => {
       }
       URL.revokeObjectURL(workerUrl);
       if (processedImageUrlRef.current) {
-        URL.revokeObjectURL(processedImageUrlRef. current);
+        URL.revokeObjectURL(processedImageUrlRef.current);
       }
     };
   }, []);
@@ -409,12 +669,12 @@ const ImgikaTool: React.FC = () => {
   // 下载文件的辅助函数
   const downloadBlob = useCallback((blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
-    const a = document. createElement('a');
-    a. href = url;
-    a. download = filename;
-    document. body.appendChild(a);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
     a.click();
-    document. body.removeChild(a);
+    document.body.removeChild(a);
     // 延迟释放URL，确保下载开始
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, []);
@@ -438,7 +698,7 @@ const ImgikaTool: React.FC = () => {
     }
     
     // 合并所有块
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk. length, 0);
+    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
     const result = new Uint8Array(totalLength);
     let offset = 0;
     for (const chunk of chunks) {
@@ -513,7 +773,7 @@ const ImgikaTool: React.FC = () => {
     
     if (isProcessing) return;
     
-    const files = e.dataTransfer. files;
+    const files = e.dataTransfer.files;
     if (files && files.length > 0) {
       setDataFile(files[0]);
     }
@@ -541,6 +801,8 @@ const ImgikaTool: React.FC = () => {
     
     setIsProcessing(true);
     setProgress(0);
+    setDecodeResult(null);
+    setShowPreview(false);
     
     // 清理之前的处理结果
     if (processedImageUrlRef.current) {
@@ -603,7 +865,7 @@ const ImgikaTool: React.FC = () => {
         } else if (type === 'encodeResult') {
           worker.removeEventListener('message', handleMessage);
           
-          const blob = new Blob([result. data], { type: 'image/png' });
+          const blob = new Blob([result.data], { type: 'image/png' });
           setProcessedImage(blob);
           
           alert(`文件编码成功！\n原始尺寸: ${result.originalWidth}x${result.originalHeight}\n编码后尺寸: ${result.finalWidth}x${result.finalHeight}\n隐藏数据大小: ${result.fileSize} 字节\n图片文件名: ${result.imageFilename}\n数据文件名: ${result.dataFilename}\n请下载生成的图片。`);
@@ -618,7 +880,7 @@ const ImgikaTool: React.FC = () => {
       worker.addEventListener('message', handleMessage);
       
       // 创建新的 ArrayBuffer 副本以避免 detached buffer 问题
-      const imageDataCopy = imageData.slice(). buffer;
+      const imageDataCopy = imageData.slice().buffer;
       const fileDataCopy = fileData.slice().buffer;
       
       // 发送数据到 Worker（使用 Transferable 避免复制）
@@ -637,7 +899,7 @@ const ImgikaTool: React.FC = () => {
   };
 
   const decodeData = async () => {
-    if (! imageFile || !workerRef.current) return;
+    if (!imageFile || !workerRef.current) return;
     
     const worker = workerRef.current;
     
@@ -653,19 +915,37 @@ const ImgikaTool: React.FC = () => {
         if (type === 'progress') {
           setProgress(workerProgress);
         } else if (type === 'log') {
-          console. log('Worker:', message);
+          console.log('Worker:', message);
         } else if (type === 'decodeResult') {
           worker.removeEventListener('message', handleMessage);
+          
+          // 保存解码结果用于预览
+          setDecodeResult({
+            fileData: new Uint8Array(result.fileData),
+            originalImageData: new Uint8Array(result.originalImageData),
+            originalDataFilename: result.originalDataFilename,
+            outputImageFilename: result.outputImageFilename,
+            fileSize: result.fileSize,
+            originalWidth: result.originalWidth,
+            originalHeight: result.originalHeight,
+            sha256Match: result.sha256Match
+          });
+          
+          // 检查是否可以预览
+          const previewType = getPreviewType(result.originalDataFilename);
+          if (previewType !== 'none') {
+            setShowPreview(true);
+          }
           
           // 下载提取的文件
           const fileBlob = new Blob([result.fileData]);
           downloadBlob(fileBlob, result.originalDataFilename);
           
           // 下载原始图片
-          const imageBlob = new Blob([result. originalImageData], { type: 'image/png' });
+          const imageBlob = new Blob([result.originalImageData], { type: 'image/png' });
           downloadBlob(imageBlob, result.outputImageFilename);
           
-          alert(`文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result. originalWidth}x${result.originalHeight})\nSHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}`);
+          alert(`文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result.originalWidth}x${result.originalHeight})\nSHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}${previewType !== 'none' ?  '\n\n文件可预览，点击下方按钮查看预览' : ''}`);
           
           if (! result.sha256Match) {
             console.warn('SHA256校验失败，数据可能已损坏');
@@ -705,8 +985,10 @@ const ImgikaTool: React.FC = () => {
     setProgress(0);
     setImageDragActive(false);
     setDataDragActive(false);
+    setDecodeResult(null);
+    setShowPreview(false);
     if (processedImageUrlRef.current) {
-      URL.revokeObjectURL(processedImageUrlRef. current);
+      URL.revokeObjectURL(processedImageUrlRef.current);
       processedImageUrlRef.current = null;
     }
     if (imageInputRef.current) {
@@ -716,6 +998,9 @@ const ImgikaTool: React.FC = () => {
       dataInputRef.current.value = '';
     }
   };
+
+  // 判断解码结果是否可预览
+  const canPreview = decodeResult && getPreviewType(decodeResult.originalDataFilename) !== 'none';
 
   return (
     <div className="bg-[var(--md-sys-color-surface-container)] rounded-[32px] p-8 border border-[var(--md-sys-color-outline-variant)]/20">
@@ -885,7 +1170,7 @@ const ImgikaTool: React.FC = () => {
         </button>
         
         {isProcessing && (
-          <div className="w-full max-w-md mt-4 bg-[var(--md-sys-color-surface)] rounded-full h-2. 5 overflow-hidden">
+          <div className="w-full max-w-md mt-4 bg-[var(--md-sys-color-surface)] rounded-full h-2.5 overflow-hidden">
             <div
               className="bg-[var(--md-sys-color-primary)] h-2.5 rounded-full transition-all duration-300"
               style={{ width: `${progress}%` }}
@@ -893,7 +1178,7 @@ const ImgikaTool: React.FC = () => {
           </div>
         )}
         
-        {! isProcessing && (imageFile || dataFile || processedImage) && (
+        {! isProcessing && (imageFile || dataFile || processedImage || decodeResult) && (
           <button
             className="mt-4 px-6 py-2 rounded-full bg-[var(--md-sys-color-surface)] text-[var(--md-sys-color-on-surface)] font-medium hover:bg-[var(--md-sys-color-surface-variant)] transition-colors"
             onClick={resetAll}
@@ -911,7 +1196,7 @@ const ImgikaTool: React.FC = () => {
           </h3>
           <div className="bg-[var(--md-sys-color-surface)] p-4 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
             <div className="text-center text-[var(--md-sys-color-on-surface-variant)] mb-4">
-              <p>文件大小: {(processedImage. size / 1024 / 1024).toFixed(2)} MB</p>
+              <p>文件大小: {(processedImage.size / 1024 / 1024).toFixed(2)} MB</p>
             </div>
             <div className="mt-4 flex justify-center">
               <button
@@ -925,6 +1210,80 @@ const ImgikaTool: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 解码结果展示（仅解码模式） */}
+      {mode === 'decode' && decodeResult && (
+        <div className="mt-8">
+          <h3 className="text-xl font-semibold mb-4 text-[var(--md-sys-color-on-surface)]">
+            解码结果
+          </h3>
+          <div className="bg-[var(--md-sys-color-surface)] p-6 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* 提取的文件信息 */}
+              <div className="space-y-2">
+                <h4 className="font-medium text-[var(--md-sys-color-on-surface)]">📄 提取的文件</h4>
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] break-all">
+                  文件名: {decodeResult.originalDataFilename}
+                </p>
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                  大小: {(decodeResult.fileSize / 1024 / 1024).toFixed(2)} MB ({decodeResult.fileSize} 字节)
+                </p>
+                <p className={`text-sm ${decodeResult.sha256Match ?  'text-green-500' : 'text-red-500'}`}>
+                  SHA256校验: {decodeResult.sha256Match ? '通过 ✓' : '失败 ✗'}
+                </p>
+              </div>
+              
+              {/* 原始图片信息 */}
+              <div className="space-y-2">
+                <h4 className="font-medium text-[var(--md-sys-color-on-surface)]">🖼️ 原始图片</h4>
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] break-all">
+                  文件名: {decodeResult.outputImageFilename}
+                </p>
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                  尺寸: {decodeResult.originalWidth}x{decodeResult.originalHeight}
+                </p>
+              </div>
+            </div>
+            
+            {/* 预览按钮 */}
+            {canPreview && (
+              <div className="mt-6 flex justify-center">
+                <button
+                  onClick={() => setShowPreview(true)}
+                  className="px-6 py-3 rounded-full bg-[var(--md-sys-color-tertiary-container)] text-[var(--md-sys-color-on-tertiary-container)] font-medium flex items-center gap-2 hover:shadow-lg transition-shadow"
+                >
+                  <span>👁️</span>
+                  预览提取的文件
+                </button>
+              </div>
+            )}
+            
+            {/* 重新下载按钮 */}
+            <div className="mt-4 flex justify-center gap-4 flex-wrap">
+              <button
+                onClick={() => {
+                  const fileBlob = new Blob([decodeResult.fileData as BlobPart]);
+                  downloadBlob(fileBlob, decodeResult.originalDataFilename);
+                }}
+                className="px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium flex items-center gap-2 hover:shadow-lg transition-shadow"
+              >
+                <span>⬇</span>
+                重新下载文件
+              </button>
+              <button
+                onClick={() => {
+                  const imageBlob = new Blob([decodeResult.originalImageData as BlobPart], { type: 'image/png' });
+                  downloadBlob(imageBlob, decodeResult.outputImageFilename);
+                }}
+                className="px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium flex items-center gap-2 hover:shadow-lg transition-shadow"
+              >
+                <span>⬇</span>
+                重新下载图片
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       
       {/* 说明文档 */}
       <div className="mt-8 bg-[var(--md-sys-color-surface)] p-6 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
@@ -932,14 +1291,14 @@ const ImgikaTool: React.FC = () => {
           使用说明
         </h3>
         <div className="text-sm text-[var(--md-sys-color-on-surface-variant)] space-y-2">
-          {mode === 'encode' ?  (
+          {mode === 'encode' ? (
             <>
               <p>• <strong>编码模式</strong>：将任意文件隐藏到图片的Alpha通道中</p>
               <p>• 上传一张RGB图片作为载体（支持PNG/JPG/WebP等格式）</p>
               <p>• 选择要隐藏的文件（任意格式，支持大文件）</p>
               <p>• 处理后会生成一张PNG图片，包含隐藏的数据</p>
               <p>• 数据格式（Header 1068字节）：</p>
-              <p className="pl-4">- 0-7字节：文件大小</p>
+                            <p className="pl-4">- 0-7字节：文件大小</p>
               <p className="pl-4">- 8-11字节：原始图片宽度</p>
               <p className="pl-4">- 12-43字节：SHA256校验和</p>
               <p className="pl-4">- 44-555字节：原始图片文件名</p>
@@ -954,11 +1313,27 @@ const ImgikaTool: React.FC = () => {
               <p>• 会自动提取并下载隐藏的文件（使用原始文件名）</p>
               <p>• 同时会恢复并下载原始的RGB图片（使用原始文件名）</p>
               <p>• 会自动验证SHA256校验和以确保数据完整性</p>
+              <p>• <strong>文件预览</strong>：支持预览以下类型的文件：</p>
+              <p className="pl-4">- 图片：JPG, PNG, GIF, WebP, SVG, BMP 等</p>
+              <p className="pl-4">- 视频：MP4, WebM, OGG, MOV 等</p>
+              <p className="pl-4">- 音频：MP3, WAV, FLAC, AAC 等</p>
+              <p className="pl-4">- 文本：TXT, MD, LOG, CSV 等</p>
+              <p className="pl-4">- 代码：JS, TS, PY, JAVA, C, GO, RS, JSON, HTML, CSS 等</p>
+              <p className="pl-4">- 文档：PDF</p>
               <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持大文件解码</p>
             </>
           )}
         </div>
       </div>
+
+      {/* 文件预览弹窗 */}
+      {showPreview && decodeResult && (
+        <FilePreview
+          fileData={decodeResult.fileData}
+          filename={decodeResult.originalDataFilename}
+          onClose={() => setShowPreview(false)}
+        />
+      )}
     </div>
   );
 };
