@@ -1,27 +1,453 @@
-import React, { useState, useRef, DragEvent } from 'react';
+import React, { useState, useRef, DragEvent, useCallback, useEffect } from 'react';
+
+// Worker 代码作为字符串
+const workerCode = `
+const HEADER_SIZE = 1068;
+const FILE_SIZE_OFFSET = 0;
+const ORIGINAL_WIDTH_OFFSET = 8;
+const SHA256_OFFSET = 12;
+const IMAGE_FILENAME_OFFSET = 44;
+const DATA_FILENAME_OFFSET = 556;
+const FILENAME_MAX_LENGTH = 512;
+
+// 计算SHA256
+async function calculateSHA256(data) {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return new Uint8Array(hashBuffer);
+}
+
+// 编码文件名
+function encodeFilename(filename, maxLength) {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(filename);
+  const result = new Uint8Array(maxLength);
+  const copyLength = Math.min(encoded.length, maxLength - 1);
+  result.set(encoded.subarray(0, copyLength), 0);
+  return result;
+}
+
+// 解码文件名
+function decodeFilename(bytes) {
+  let endIndex = bytes.indexOf(0);
+  if (endIndex === -1) endIndex = bytes.length;
+  const decoder = new TextDecoder('utf-8');
+  return decoder.decode(bytes.subarray(0, endIndex));
+}
+
+// 分块处理函数
+async function processChunked(totalIterations, chunkSize, processFunc, progressCallback) {
+  let processed = 0;
+  while (processed < totalIterations) {
+    const end = Math.min(processed + chunkSize, totalIterations);
+    await processFunc(processed, end);
+    processed = end;
+    if (progressCallback) {
+      progressCallback(processed / totalIterations);
+    }
+    // 让出控制权，防止阻塞
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+}
+
+// 编码处理
+async function encodeImage(imageData, imgWidth, imgHeight, fileData, imageFilename, dataFilename) {
+  // 确保宽高是有效的正整数
+  const originalWidth = Math.max(1, Math.floor(Number(imgWidth) || 1));
+  const originalHeight = Math.max(1, Math.floor(Number(imgHeight) || 1));
+  const aspectRatio = originalWidth / originalHeight;
+  
+  self.postMessage({ type: 'progress', progress: 10 });
+  self.postMessage({ 
+    type: 'log', 
+    message: 'encodeImage called with width=' + originalWidth + ', height=' + originalHeight
+  });
+  
+  // 计算SHA256
+  const fileBytes = new Uint8Array(fileData);
+  const sha256 = await calculateSHA256(fileBytes);
+  
+  self.postMessage({ type: 'progress', progress: 20 });
+  
+  // 计算所需空间
+  const totalBytesNeeded = HEADER_SIZE + fileBytes.length;
+  
+  // 计算保持宽高比的最小尺寸
+  let finalHeight = Math.max(1, Math.ceil(Math.sqrt(totalBytesNeeded / aspectRatio)));
+  let finalWidth = Math.max(1, Math.ceil(finalHeight * aspectRatio));
+  
+  // 确保是整数
+  finalWidth = Math. floor(finalWidth);
+  finalHeight = Math.floor(finalHeight);
+  
+  while (finalWidth * finalHeight < totalBytesNeeded) {
+    finalHeight++;
+    finalWidth = Math. max(1, Math.floor(Math.ceil(finalHeight * aspectRatio)));
+  }
+  
+  // 如果原图已经足够大，使用原图尺寸
+  if (originalWidth * originalHeight >= totalBytesNeeded) {
+    finalWidth = originalWidth;
+    finalHeight = originalHeight;
+  }
+  
+  // 再次确保是有效的正整数
+  finalWidth = Math.max(1, Math.floor(finalWidth));
+  finalHeight = Math.max(1, Math.floor(finalHeight));
+  
+  self.postMessage({ type: 'progress', progress: 25 });
+  self.postMessage({ 
+    type: 'log', 
+    message: 'Original: ' + originalWidth + 'x' + originalHeight + ', Final: ' + finalWidth + 'x' + finalHeight
+  });
+  
+  // 创建 OffscreenCanvas
+  let canvas;
+  try {
+    canvas = new OffscreenCanvas(finalWidth, finalHeight);
+  } catch (e) {
+    throw new Error('Failed to create OffscreenCanvas: width=' + finalWidth + ', height=' + finalHeight + ', error=' + e.message);
+  }
+  
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Failed to get 2d context');
+  }
+  
+  // 创建 ImageBitmap 并绘制
+  const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+  const imageBitmap = await createImageBitmap(blob);
+  ctx.drawImage(imageBitmap, 0, 0, finalWidth, finalHeight);
+  imageBitmap.close();
+  
+  self.postMessage({ type: 'progress', progress: 35 });
+  
+  // 获取像素数据
+  const resultImageData = ctx.getImageData(0, 0, finalWidth, finalHeight);
+  const pixels = resultImageData.data;
+  
+  // 构建header
+  const header = new ArrayBuffer(HEADER_SIZE);
+  const headerView = new DataView(header);
+  const headerBytes = new Uint8Array(header);
+  
+  headerView.setBigUint64(FILE_SIZE_OFFSET, BigInt(fileBytes.length), true);
+  headerView.setUint32(ORIGINAL_WIDTH_OFFSET, originalWidth, true);
+  headerBytes.set(sha256, SHA256_OFFSET);
+  headerBytes.set(encodeFilename(imageFilename, FILENAME_MAX_LENGTH), IMAGE_FILENAME_OFFSET);
+  headerBytes.set(encodeFilename(dataFilename, FILENAME_MAX_LENGTH), DATA_FILENAME_OFFSET);
+  
+  // 合并数据
+  const combinedData = new Uint8Array(HEADER_SIZE + fileBytes.length);
+  combinedData.set(headerBytes, 0);
+  combinedData.set(fileBytes, HEADER_SIZE);
+  
+  self.postMessage({ type: 'progress', progress: 40 });
+  
+  // 分块写入Alpha通道
+  const totalPixels = finalWidth * finalHeight;
+  const CHUNK_SIZE = 100000;
+  
+  await processChunked(totalPixels, CHUNK_SIZE, async (start, end) => {
+    for (let i = start; i < end; i++) {
+      const pixelIndex = i * 4;
+      if (i < combinedData.length) {
+        pixels[pixelIndex + 3] = combinedData[i];
+      } else {
+        pixels[pixelIndex + 3] = 255;
+      }
+    }
+  }, (progress) => {
+    self.postMessage({ type: 'progress', progress: 40 + Math.round(progress * 50) });
+  });
+  
+  ctx.putImageData(resultImageData, 0, 0);
+  
+  self.postMessage({ type: 'progress', progress: 95 });
+  
+  // 转换为Blob
+  const resultBlob = await canvas.convertToBlob({ type: 'image/png' });
+  const arrayBuffer = await resultBlob.arrayBuffer();
+  
+  self.postMessage({ type: 'progress', progress: 100 });
+  
+  return {
+    data: new Uint8Array(arrayBuffer),
+    originalWidth,
+    originalHeight,
+    finalWidth,
+    finalHeight,
+    fileSize: fileBytes.length,
+    imageFilename,
+    dataFilename
+  };
+}
+
+// 解码处理
+async function decodeImage(imageData) {
+  self.postMessage({ type: 'progress', progress: 5 });
+  
+  // 创建 ImageBitmap
+  const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+  const imageBitmap = await createImageBitmap(blob);
+  
+  const width = Math.max(1, Math.floor(imageBitmap.width));
+  const height = Math.max(1, Math.floor(imageBitmap.height));
+  
+  self.postMessage({ type: 'progress', progress: 15 });
+  self.postMessage({ type: 'log', message: 'Decoding image: ' + width + 'x' + height });
+  
+  // 创建 OffscreenCanvas
+  let canvas;
+  try {
+    canvas = new OffscreenCanvas(width, height);
+  } catch (e) {
+    imageBitmap.close();
+    throw new Error('Failed to create OffscreenCanvas: width=' + width + ', height=' + height + ', error=' + e.message);
+  }
+  
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    imageBitmap. close();
+    throw new Error('Failed to get 2d context');
+  }
+  
+  ctx.drawImage(imageBitmap, 0, 0);
+  imageBitmap.close();
+  
+  self.postMessage({ type: 'progress', progress: 25 });
+  
+  // 获取像素数据
+  const resultImageData = ctx.getImageData(0, 0, width, height);
+  const pixels = resultImageData.data;
+  const totalPixels = width * height;
+  
+  if (totalPixels < HEADER_SIZE) {
+    throw new Error('图片太小，不是有效的IMGika图片');
+  }
+  
+  // 读取header
+  const headerBytes = new Uint8Array(HEADER_SIZE);
+  for (let i = 0; i < HEADER_SIZE; i++) {
+    headerBytes[i] = pixels[i * 4 + 3];
+  }
+  
+  self.postMessage({ type: 'progress', progress: 35 });
+  
+  // 解析header
+  const headerView = new DataView(headerBytes. buffer);
+  const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
+  const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
+  const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
+  
+  const imageFilenameBytes = headerBytes.slice(IMAGE_FILENAME_OFFSET, IMAGE_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+  const originalImageFilename = decodeFilename(imageFilenameBytes) || 'original_image.png';
+  
+  const dataFilenameBytes = headerBytes.slice(DATA_FILENAME_OFFSET, DATA_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+  const originalDataFilename = decodeFilename(dataFilenameBytes) || 'extracted_file.bin';
+  
+  self.postMessage({ 
+    type: 'log', 
+    message: 'File size: ' + fileSize + ', Original width: ' + originalWidth + ', Image filename: ' + originalImageFilename + ', Data filename: ' + originalDataFilename
+  });
+  
+  // 验证文件大小
+  const maxFileSize = totalPixels - HEADER_SIZE;
+  if (fileSize <= 0 || fileSize > maxFileSize) {
+    throw new Error('无效的文件大小 (' + fileSize + ')，可能不是有效的IMGika图片。最大可存储: ' + maxFileSize + ' 字节');
+  }
+  
+  self.postMessage({ type: 'progress', progress: 45 });
+  
+  // 分块提取文件数据
+  const fileData = new Uint8Array(fileSize);
+  const CHUNK_SIZE = 100000;
+  
+  await processChunked(fileSize, CHUNK_SIZE, async (start, end) => {
+    for (let i = start; i < end; i++) {
+      const pixelIndex = (i + HEADER_SIZE) * 4;
+      fileData[i] = pixels[pixelIndex + 3];
+    }
+  }, (progress) => {
+    self.postMessage({ type: 'progress', progress: 45 + Math.round(progress * 30) });
+  });
+  
+  self.postMessage({ type: 'progress', progress: 80 });
+  
+  // 验证SHA256
+  const calculatedSHA256 = await calculateSHA256(fileData);
+  let sha256Match = true;
+  for (let i = 0; i < 32; i++) {
+    if (storedSHA256[i] !== calculatedSHA256[i]) {
+      sha256Match = false;
+      break;
+    }
+  }
+  
+  self.postMessage({ type: 'progress', progress: 85 });
+  
+  // 恢复原始RGB图片
+  const currentAspectRatio = width / height;
+  const originalHeight = Math.max(1, Math.floor(Math.round(originalWidth / currentAspectRatio)));
+  const safeOriginalWidth = Math.max(1, Math.floor(originalWidth));
+  
+  self.postMessage({ type: 'log', message: 'Restoring original image: ' + safeOriginalWidth + 'x' + originalHeight });
+  
+  let originalCanvas;
+  try {
+    originalCanvas = new OffscreenCanvas(safeOriginalWidth, originalHeight);
+  } catch (e) {
+    throw new Error('Failed to create original OffscreenCanvas: width=' + safeOriginalWidth + ', height=' + originalHeight + ', error=' + e.message);
+  }
+  
+  const originalCtx = originalCanvas.getContext('2d');
+  if (!originalCtx) {
+    throw new Error('Failed to get original 2d context');
+  }
+  
+  // 重新创建 ImageBitmap 用于缩放
+  const blob2 = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+  const imageBitmap2 = await createImageBitmap(blob2);
+  originalCtx.drawImage(imageBitmap2, 0, 0, safeOriginalWidth, originalHeight);
+  imageBitmap2.close();
+  
+  // 设置Alpha为255
+  const originalImageData = originalCtx.getImageData(0, 0, safeOriginalWidth, originalHeight);
+  const originalPixels = originalImageData. data;
+  
+  for (let i = 0; i < originalPixels.length; i += 4) {
+    originalPixels[i + 3] = 255;
+  }
+  
+  originalCtx.putImageData(originalImageData, 0, 0);
+  
+  const originalBlob = await originalCanvas.convertToBlob({ type: 'image/png' });
+  const originalArrayBuffer = await originalBlob. arrayBuffer();
+  
+  self.postMessage({ type: 'progress', progress: 100 });
+  
+  // 处理输出文件名
+  let outputImageFilename = originalImageFilename;
+  const lastDotIndex = outputImageFilename.lastIndexOf('.');
+  if (lastDotIndex > 0) {
+    outputImageFilename = outputImageFilename. substring(0, lastDotIndex) + '. png';
+  } else {
+    outputImageFilename = outputImageFilename + '.png';
+  }
+  
+  return {
+    fileData: fileData,
+    originalImageData: new Uint8Array(originalArrayBuffer),
+    originalDataFilename,
+    outputImageFilename,
+    fileSize,
+    originalWidth: safeOriginalWidth,
+    originalHeight,
+    sha256Match
+  };
+}
+
+// 消息处理
+self.onmessage = async (e) => {
+  const { type, payload } = e.data;
+  
+  try {
+    if (type === 'encode') {
+      const result = await encodeImage(
+        payload.imageData,
+        payload.imgWidth,
+        payload.imgHeight,
+        payload.fileData,
+        payload.imageFilename,
+        payload.dataFilename
+      );
+      self.postMessage({ type: 'encodeResult', result }, [result.data. buffer]);
+    } else if (type === 'decode') {
+      const result = await decodeImage(payload.imageData);
+      self.postMessage({ 
+        type: 'decodeResult', 
+        result 
+      }, [result.fileData.buffer, result.originalImageData.buffer]);
+    }
+  } catch (error) {
+    self.postMessage({ type: 'error', error: error.message });
+  }
+};
+`;
 
 const ImgikaTool: React.FC = () => {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [dataFile, setDataFile] = useState<File | null>(null);
-  const [processedImage, setProcessedImage] = useState<string | null>(null);
+  const [processedImage, setProcessedImage] = useState<Blob | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [mode, setMode] = useState<'encode' | 'decode'>('encode');
   const [imageDragActive, setImageDragActive] = useState(false);
   const [dataDragActive, setDataDragActive] = useState(false);
   
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const dataInputRef = useRef<HTMLInputElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const processedImageUrlRef = useRef<string | null>(null);
 
-  // Header 常量定义
-  const HEADER_SIZE = 1068; // 总 header 大小
-  const FILE_SIZE_OFFSET = 0;       // 0-7: 文件大小 (8字节)
-  const ORIGINAL_WIDTH_OFFSET = 8;  // 8-11: 原始宽度 (4字节)
-  const SHA256_OFFSET = 12;         // 12-43: SHA256 (32字节)
-  const IMAGE_FILENAME_OFFSET = 44; // 44-555: 图片文件名 (512字节)
-  const DATA_FILENAME_OFFSET = 556; // 556-1067: 数据文件名 (512字节)
-  const FILENAME_MAX_LENGTH = 512;  // 文件名最大长度
+  // 初始化 Worker
+  useEffect(() => {
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    workerRef.current = new Worker(workerUrl);
+    
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+      }
+      URL.revokeObjectURL(workerUrl);
+      if (processedImageUrlRef.current) {
+        URL.revokeObjectURL(processedImageUrlRef. current);
+      }
+    };
+  }, []);
+
+  // 下载文件的辅助函数
+  const downloadBlob = useCallback((blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document. createElement('a');
+    a. href = url;
+    a. download = filename;
+    document. body.appendChild(a);
+    a.click();
+    document. body.removeChild(a);
+    // 延迟释放URL，确保下载开始
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, []);
+
+  // 分块读取文件
+  const readFileInChunks = useCallback(async (file: File, onProgress?: (progress: number) => void): Promise<Uint8Array> => {
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
+    const totalSize = file.size;
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+    
+    while (loaded < totalSize) {
+      const end = Math.min(loaded + CHUNK_SIZE, totalSize);
+      const chunk = file.slice(loaded, end);
+      const arrayBuffer = await chunk.arrayBuffer();
+      chunks.push(new Uint8Array(arrayBuffer));
+      loaded = end;
+      if (onProgress) {
+        onProgress(loaded / totalSize);
+      }
+    }
+    
+    // 合并所有块
+    const totalLength = chunks.reduce((acc, chunk) => acc + chunk. length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    return result;
+  }, []);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -37,7 +463,6 @@ const ImgikaTool: React.FC = () => {
     }
   };
 
-  // 拖拽处理函数
   const handleDragEnter = (e: DragEvent<HTMLDivElement>, type: 'image' | 'data') => {
     e.preventDefault();
     e.stopPropagation();
@@ -82,73 +507,51 @@ const ImgikaTool: React.FC = () => {
   };
 
   const handleDataDrop = (e: DragEvent<HTMLDivElement>) => {
-    e. preventDefault();
+    e.preventDefault();
     e.stopPropagation();
     setDataDragActive(false);
     
     if (isProcessing) return;
     
-    const files = e.dataTransfer.files;
+    const files = e.dataTransfer. files;
     if (files && files.length > 0) {
       setDataFile(files[0]);
     }
   };
 
-  // 计算SHA256
-  const calculateSHA256 = async (data: Uint8Array): Promise<Uint8Array> => {
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data as BufferSource);
-    return new Uint8Array(hashBuffer);
-  };
-
-  // 将字符串编码为固定长度的字节数组（UTF-8编码，不足部分填充0）
-  const encodeFilename = (filename: string, maxLength: number): Uint8Array => {
-    const encoder = new TextEncoder();
-    const encoded = encoder.encode(filename);
-    const result = new Uint8Array(maxLength);
-    // 复制文件名（截断如果太长）
-    const copyLength = Math.min(encoded. length, maxLength - 1); // 留一个字节给结束符
-    result.set(encoded.subarray(0, copyLength), 0);
-    // 剩余部分已经是0（Uint8Array默认填充0）
-    return result;
-  };
-
-  // 从字节数组解码文件名（UTF-8解码，遇到0结束）
-  const decodeFilename = (bytes: Uint8Array): string => {
-    // 找到第一个0字节的位置
-    let endIndex = bytes.indexOf(0);
-    if (endIndex === -1) {
-      endIndex = bytes.length;
-    }
-    const decoder = new TextDecoder('utf-8');
-    return decoder.decode(bytes.subarray(0, endIndex));
-  };
-
-  // 加载图片并返回ImageData
-  const loadImage = (file: File): Promise<HTMLImageElement> => {
+  // 获取图片尺寸
+  const getImageDimensions = (file: File): Promise<{ width: number; height: number }> => {
     return new Promise((resolve, reject) => {
       const img = new Image();
       const url = URL.createObjectURL(file);
       img.onload = () => {
         URL.revokeObjectURL(url);
-        resolve(img);
+        resolve({ width: img.width, height: img.height });
       };
       img.onerror = () => {
         URL.revokeObjectURL(url);
-        reject(new Error('图片加载失败'));
+        reject(new Error('无法加载图片'));
       };
       img.src = url;
     });
   };
 
   const handleProcess = async () => {
-    if (!imageFile) return;
+    if (!imageFile || !workerRef.current) return;
     
     setIsProcessing(true);
     setProgress(0);
     
+    // 清理之前的处理结果
+    if (processedImageUrlRef.current) {
+      URL.revokeObjectURL(processedImageUrlRef.current);
+      processedImageUrlRef.current = null;
+    }
+    setProcessedImage(null);
+    
     try {
       if (mode === 'encode') {
-        if (!dataFile) {
+        if (! dataFile) {
           throw new Error('请选择要隐藏的文件');
         }
         await encodeData();
@@ -164,319 +567,136 @@ const ImgikaTool: React.FC = () => {
   };
 
   const encodeData = async () => {
-    if (!imageFile || !dataFile || !canvasRef.current) return;
+    if (!imageFile || !dataFile || !workerRef.current) return;
     
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) throw new Error('无法获取 Canvas 上下文');
+    const worker = workerRef.current;
+    
+    // 读取图片尺寸
+    const { width: imgWidth, height: imgHeight } = await getImageDimensions(imageFile);
+    
+    console.log('Image dimensions:', imgWidth, imgHeight);
+    
+    setProgress(2);
+    
+    // 分块读取图片文件
+    const imageData = await readFileInChunks(imageFile, (p) => {
+      setProgress(2 + Math.round(p * 3));
+    });
     
     setProgress(5);
     
-    // 1. 加载图片
-    const img = await loadImage(imageFile);
-    const originalWidth = img.width;
-    const originalHeight = img.height;
-    const aspectRatio = originalWidth / originalHeight;
+    // 分块读取数据文件
+    const fileData = await readFileInChunks(dataFile, (p) => {
+      setProgress(5 + Math.round(p * 5));
+    });
     
     setProgress(10);
     
-    // 2. 读取要隐藏的二进制文件
-    const fileBuffer = await dataFile.arrayBuffer();
-    const fileBytes = new Uint8Array(fileBuffer);
-    
-    setProgress(15);
-    
-    // 3. 计算SHA256
-    const sha256 = await calculateSHA256(fileBytes);
-    
-    setProgress(20);
-    
-    // 4. 计算所需空间
-    // Header: 8字节(文件大小) + 4字节(原始宽度) + 32字节(SHA256) + 512字节(图片文件名) + 512字节(数据文件名) = 1068字节
-    const totalBytesNeeded = HEADER_SIZE + fileBytes.length;
-    
-    // 5. 计算保持宽高比的最小尺寸
-    // w * h >= totalBytesNeeded
-    // w / h = aspectRatio
-    // h = sqrt(totalBytesNeeded / aspectRatio)
-    let finalHeight = Math.ceil(Math.sqrt(totalBytesNeeded / aspectRatio));
-    let finalWidth = Math.ceil(finalHeight * aspectRatio);
-    
-    // 确保总像素数足够
-    while (finalWidth * finalHeight < totalBytesNeeded) {
-      finalHeight++;
-      finalWidth = Math.ceil(finalHeight * aspectRatio);
-    }
-    
-    // 6. 如果原图已经足够大，使用原图尺寸
-    if (originalWidth * originalHeight >= totalBytesNeeded) {
-      finalWidth = originalWidth;
-      finalHeight = originalHeight;
-    }
-    
-    setProgress(25);
-    console.log(`原始尺寸: ${originalWidth}x${originalHeight}`);
-    console.log(`最终尺寸: ${finalWidth}x${finalHeight}`);
-    console.log(`需要像素: ${totalBytesNeeded}, 可用像素: ${finalWidth * finalHeight}`);
-    console.log(`图片文件名: ${imageFile.name}`);
-    console.log(`数据文件名: ${dataFile.name}`);
-    
-    // 7.  设置画布并绘制放大后的图片
-    canvas.width = finalWidth;
-    canvas.height = finalHeight;
-    
-    // 绘制原图到新尺寸（可能会拉伸）
-    ctx.drawImage(img, 0, 0, finalWidth, finalHeight);
-    
-    setProgress(30);
-    
-    // 8. 获取像素数据
-    const imageData = ctx.getImageData(0, 0, finalWidth, finalHeight);
-    const pixels = imageData.data;
-    
-    // 9. 构建header数据 (1068字节)
-    const header = new ArrayBuffer(HEADER_SIZE);
-    const headerView = new DataView(header);
-    const headerBytes = new Uint8Array(header);
-    
-    // 0-7: 文件大小 (8字节, 小端序)
-    headerView.setBigUint64(FILE_SIZE_OFFSET, BigInt(fileBytes.length), true);
-    
-    // 8-11: 原始图片宽度 (4字节, 小端序)
-    headerView.setUint32(ORIGINAL_WIDTH_OFFSET, originalWidth, true);
-    
-    // 12-43: SHA256校验和 (32字节)
-    headerBytes.set(sha256, SHA256_OFFSET);
-    
-    // 44-555: 原始图片文件名 (512字节)
-    const imageFilenameBytes = encodeFilename(imageFile.name, FILENAME_MAX_LENGTH);
-    headerBytes.set(imageFilenameBytes, IMAGE_FILENAME_OFFSET);
-    
-    // 556-1067: 二进制数据原始文件名 (512字节)
-    const dataFilenameBytes = encodeFilename(dataFile.name, FILENAME_MAX_LENGTH);
-    headerBytes. set(dataFilenameBytes, DATA_FILENAME_OFFSET);
-    
-    setProgress(40);
-    
-    // 10. 合并header和文件数据
-    const combinedData = new Uint8Array(HEADER_SIZE + fileBytes.length);
-    combinedData.set(headerBytes, 0);
-    combinedData.set(fileBytes, HEADER_SIZE);
-    
-    // 11. 写入Alpha通道
-    // 按从上到下，从左到右的顺序（这是ImageData的默认顺序）
-    const totalPixels = finalWidth * finalHeight;
-    for (let i = 0; i < totalPixels; i++) {
-      const pixelIndex = i * 4; // 每个像素占4个字节 (R, G, B, A)
+    return new Promise<void>((resolve, reject) => {
+      const handleMessage = (e: MessageEvent) => {
+        const { type, progress: workerProgress, result, error, message } = e.data;
+        
+        if (type === 'progress') {
+          setProgress(workerProgress);
+        } else if (type === 'log') {
+          console.log('Worker:', message);
+        } else if (type === 'encodeResult') {
+          worker.removeEventListener('message', handleMessage);
+          
+          const blob = new Blob([result. data], { type: 'image/png' });
+          setProcessedImage(blob);
+          
+          alert(`文件编码成功！\n原始尺寸: ${result.originalWidth}x${result.originalHeight}\n编码后尺寸: ${result.finalWidth}x${result.finalHeight}\n隐藏数据大小: ${result.fileSize} 字节\n图片文件名: ${result.imageFilename}\n数据文件名: ${result.dataFilename}\n请下载生成的图片。`);
+          
+          resolve();
+        } else if (type === 'error') {
+          worker.removeEventListener('message', handleMessage);
+          reject(new Error(error));
+        }
+      };
       
-      if (i < combinedData.length) {
-        // 写入数据到Alpha通道
-        pixels[pixelIndex + 3] = combinedData[i];
-      } else {
-        // 剩余像素的Alpha通道设为255（完全不透明）
-        pixels[pixelIndex + 3] = 255;
-      }
+      worker.addEventListener('message', handleMessage);
       
-      // 更新进度
-      if (i % 50000 === 0) {
-        setProgress(40 + Math.round((i / totalPixels) * 50));
-      }
-    }
-    
-    setProgress(90);
-    
-    // 12. 更新画布
-    ctx.putImageData(imageData, 0, 0);
-    
-    setProgress(95);
-    
-    // 13. 导出为PNG
-    const resultDataUrl = canvas.toDataURL('image/png');
-    setProcessedImage(resultDataUrl);
-    
-    setProgress(100);
-    
-    alert(`文件编码成功！\n原始尺寸: ${originalWidth}x${originalHeight}\n编码后尺寸: ${finalWidth}x${finalHeight}\n隐藏数据大小: ${fileBytes.length} 字节\n图片文件名: ${imageFile.name}\n数据文件名: ${dataFile.name}\n请下载生成的图片。`);
+      // 创建新的 ArrayBuffer 副本以避免 detached buffer 问题
+      const imageDataCopy = imageData.slice(). buffer;
+      const fileDataCopy = fileData.slice().buffer;
+      
+      // 发送数据到 Worker（使用 Transferable 避免复制）
+      worker.postMessage({
+        type: 'encode',
+        payload: {
+          imageData: imageDataCopy,
+          imgWidth: Math.floor(imgWidth),
+          imgHeight: Math.floor(imgHeight),
+          fileData: fileDataCopy,
+          imageFilename: imageFile.name,
+          dataFilename: dataFile.name
+        }
+      }, [imageDataCopy, fileDataCopy]);
+    });
   };
 
   const decodeData = async () => {
-    if (! imageFile || !canvasRef.current) return;
+    if (! imageFile || !workerRef.current) return;
     
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) throw new Error('无法获取 Canvas 上下文');
+    const worker = workerRef.current;
     
-    setProgress(5);
+    // 分块读取图片文件
+    const imageData = await readFileInChunks(imageFile, (p) => {
+      setProgress(Math.round(p * 5));
+    });
     
-    // 1.  加载图片
-    const img = await loadImage(imageFile);
-    
-    setProgress(15);
-    
-    // 2. 绘制到画布
-    canvas.width = img.width;
-    canvas.height = img.height;
-    ctx.drawImage(img, 0, 0);
-    
-    setProgress(25);
-    
-    // 3. 获取像素数据
-    const imageData = ctx.getImageData(0, 0, img. width, img.height);
-    const pixels = imageData.data;
-    const totalPixels = img.width * img.height;
-    
-    // 4. 读取header (1068字节)
-    if (totalPixels < HEADER_SIZE) {
-      throw new Error('图片太小，不是有效的IMGika图片');
-    }
-    
-    const headerBytes = new Uint8Array(HEADER_SIZE);
-    for (let i = 0; i < HEADER_SIZE; i++) {
-      headerBytes[i] = pixels[i * 4 + 3]; // 读取每个像素的Alpha通道
-    }
-    
-    setProgress(35);
-    
-    // 5. 解析header
-    const headerView = new DataView(headerBytes. buffer);
-    
-    // 0-7: 文件大小
-    const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
-    
-    // 8-11: 原始图片宽度
-    const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
-    
-    // 12-43: SHA256校验和
-    const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
-    
-    // 44-555: 原始图片文件名
-    const imageFilenameBytes = headerBytes.slice(IMAGE_FILENAME_OFFSET, IMAGE_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
-    const originalImageFilename = decodeFilename(imageFilenameBytes) || 'original_image.png';
-    
-    // 556-1067: 二进制数据原始文件名
-    const dataFilenameBytes = headerBytes.slice(DATA_FILENAME_OFFSET, DATA_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
-    const originalDataFilename = decodeFilename(dataFilenameBytes) || 'extracted_file.bin';
-    
-    console.log('解析header:');
-    console.log('文件大小:', fileSize);
-    console.log('原始宽度:', originalWidth);
-    console.log('SHA256:', Array.from(storedSHA256).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('原始图片文件名:', originalImageFilename);
-    console. log('原始数据文件名:', originalDataFilename);
-    
-    // 6. 验证文件大小
-    const maxFileSize = totalPixels - HEADER_SIZE;
-    if (fileSize <= 0 || fileSize > maxFileSize) {
-      throw new Error(`无效的文件大小 (${fileSize})，可能不是有效的IMGika图片。最大可存储: ${maxFileSize} 字节`);
-    }
-    
-    setProgress(45);
-    
-    // 7. 提取文件数据
-    const fileData = new Uint8Array(fileSize);
-    for (let i = 0; i < fileSize; i++) {
-      const pixelIndex = (i + HEADER_SIZE) * 4;
-      fileData[i] = pixels[pixelIndex + 3]; // 读取Alpha通道
-      
-      // 更新进度
-      if (i % 50000 === 0) {
-        setProgress(45 + Math.round((i / fileSize) * 35));
-      }
-    }
-    
-    setProgress(80);
-    
-    // 8. 验证SHA256
-    const calculatedSHA256 = await calculateSHA256(fileData);
-    
-    let sha256Match = true;
-    for (let i = 0; i < 32; i++) {
-      if (storedSHA256[i] !== calculatedSHA256[i]) {
-        sha256Match = false;
-        break;
-      }
-    }
-    
-    console.log('计算的SHA256:', Array.from(calculatedSHA256).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('SHA256校验:', sha256Match ? '通过' : '失败');
-    
-    if (!sha256Match) {
-      console.warn('SHA256校验失败，数据可能已损坏');
-      if (! confirm('SHA256校验失败，数据可能已损坏。是否继续下载？')) {
-        throw new Error('SHA256校验失败，用户取消下载');
-      }
-    }
-    
-    setProgress(85);
-    
-    // 9. 下载提取的文件（使用原始文件名）
-    const blob = new Blob([fileData]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = originalDataFilename; // 使用从header中提取的原始文件名
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    
-    setProgress(90);
-    
-    // 10. 恢复原始RGB图片
-    // 计算原始高度（根据宽高比）
-    const currentAspectRatio = img.width / img.height;
-    const originalHeight = Math.round(originalWidth / currentAspectRatio);
-    
-    console.log(`恢复原始图片尺寸: ${originalWidth}x${originalHeight}`);
-    
-    // 创建原始尺寸的画布
-    const originalCanvas = document.createElement('canvas');
-    originalCanvas.width = originalWidth;
-    originalCanvas.height = originalHeight;
-    const originalCtx = originalCanvas.getContext('2d');
-    
-    if (originalCtx) {
-      // 将编码后的图片缩放回原始尺寸
-      originalCtx.drawImage(img, 0, 0, originalWidth, originalHeight);
-      
-      // 获取像素数据并设置Alpha为255（完全不透明）
-      const originalImageData = originalCtx.getImageData(0, 0, originalWidth, originalHeight);
-      const originalPixels = originalImageData.data;
-      
-      for (let i = 0; i < originalPixels.length; i += 4) {
-        originalPixels[i + 3] = 255; // 设置Alpha为完全不透明
-      }
-      
-      originalCtx.putImageData(originalImageData, 0, 0);
-      
-      // 下载原始图片（使用从header中提取的原始文件名）
-      // 确保文件扩展名为.png（因为我们输出的是PNG格式）
-      let outputImageFilename = originalImageFilename;
-      const lastDotIndex = outputImageFilename.lastIndexOf('.');
-      if (lastDotIndex > 0) {
-        outputImageFilename = outputImageFilename.substring(0, lastDotIndex) + '.png';
-      } else {
-        outputImageFilename = outputImageFilename + '.png';
-      }
-      
-      originalCanvas.toBlob((blob) => {
-        if (blob) {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = outputImageFilename; // 使用从header中提取的原始图片文件名
-          document. body.appendChild(a);
-          a.click();
-          document. body.removeChild(a);
-          URL.revokeObjectURL(url);
+    return new Promise<void>((resolve, reject) => {
+      const handleMessage = (e: MessageEvent) => {
+        const { type, progress: workerProgress, result, error, message } = e.data;
+        
+        if (type === 'progress') {
+          setProgress(workerProgress);
+        } else if (type === 'log') {
+          console. log('Worker:', message);
+        } else if (type === 'decodeResult') {
+          worker.removeEventListener('message', handleMessage);
+          
+          // 下载提取的文件
+          const fileBlob = new Blob([result.fileData]);
+          downloadBlob(fileBlob, result.originalDataFilename);
+          
+          // 下载原始图片
+          const imageBlob = new Blob([result. originalImageData], { type: 'image/png' });
+          downloadBlob(imageBlob, result.outputImageFilename);
+          
+          alert(`文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result. originalWidth}x${result.originalHeight})\nSHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}`);
+          
+          if (! result.sha256Match) {
+            console.warn('SHA256校验失败，数据可能已损坏');
+          }
+          
+          resolve();
+        } else if (type === 'error') {
+          worker.removeEventListener('message', handleMessage);
+          reject(new Error(error));
         }
-      }, 'image/png');
-    }
-    
-    setProgress(100);
-    
-    alert(`文件解码成功！\n- 隐藏的文件已下载为 "${originalDataFilename}" (${fileSize} 字节)\n- 原始图片已下载为 "${originalImageFilename. replace(/\.[^. ]+$/, '. png')}" (${originalWidth}x${originalHeight})\nSHA256校验: ${sha256Match ? '通过 ✓' : '失败 ✗'}`);
+      };
+      
+      worker.addEventListener('message', handleMessage);
+      
+      // 创建新的 ArrayBuffer 副本
+      const imageDataCopy = imageData.slice().buffer;
+      
+      worker.postMessage({
+        type: 'decode',
+        payload: {
+          imageData: imageDataCopy
+        }
+      }, [imageDataCopy]);
+    });
   };
+
+  const handleDownload = useCallback(() => {
+    if (processedImage) {
+      downloadBlob(processedImage, 'imgika_encoded.png');
+    }
+  }, [processedImage, downloadBlob]);
 
   const resetAll = () => {
     setImageFile(null);
@@ -485,6 +705,10 @@ const ImgikaTool: React.FC = () => {
     setProgress(0);
     setImageDragActive(false);
     setDataDragActive(false);
+    if (processedImageUrlRef.current) {
+      URL.revokeObjectURL(processedImageUrlRef. current);
+      processedImageUrlRef.current = null;
+    }
     if (imageInputRef.current) {
       imageInputRef.current.value = '';
     }
@@ -576,7 +800,7 @@ const ImgikaTool: React.FC = () => {
                   ✓ {imageFile.name}
                 </p>
                 <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] mt-1">
-                  {(imageFile.size / 1024).toFixed(2)} KB
+                  {(imageFile.size / 1024 / 1024).toFixed(2)} MB
                 </p>
               </div>
             )}
@@ -628,7 +852,7 @@ const ImgikaTool: React.FC = () => {
                     ✓ {dataFile.name}
                   </p>
                   <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] mt-1">
-                    {(dataFile.size / 1024).toFixed(2)} KB
+                    {(dataFile.size / 1024 / 1024).toFixed(2)} MB
                   </p>
                 </div>
               )}
@@ -646,7 +870,7 @@ const ImgikaTool: React.FC = () => {
               : 'bg-[var(--md-sys-color-primary)] text-[var(--md-sys-color-on-primary)] hover:shadow-xl'
           } disabled:opacity-50 disabled:cursor-not-allowed`}
           onClick={handleProcess}
-          disabled={isProcessing || ! imageFile || (mode === 'encode' && ! dataFile)}
+          disabled={isProcessing || !imageFile || (mode === 'encode' && ! dataFile)}
         >
           {isProcessing ? (
             <>
@@ -686,15 +910,17 @@ const ImgikaTool: React.FC = () => {
             处理结果
           </h3>
           <div className="bg-[var(--md-sys-color-surface)] p-4 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
+            <div className="text-center text-[var(--md-sys-color-on-surface-variant)] mb-4">
+              <p>文件大小: {(processedImage. size / 1024 / 1024).toFixed(2)} MB</p>
+            </div>
             <div className="mt-4 flex justify-center">
-              <a
-                href={processedImage}
-                download="imgika_encoded.png"
+              <button
+                onClick={handleDownload}
                 className="px-6 py-3 rounded-full bg-[var(--md-sys-color-primary)] text-[var(--md-sys-color-on-primary)] font-medium flex items-center gap-2 hover:shadow-xl transition-shadow"
               >
                 <span>⬇</span>
                 下载编码后的图片
-              </a>
+              </button>
             </div>
           </div>
         </div>
@@ -706,11 +932,11 @@ const ImgikaTool: React.FC = () => {
           使用说明
         </h3>
         <div className="text-sm text-[var(--md-sys-color-on-surface-variant)] space-y-2">
-          {mode === 'encode' ? (
+          {mode === 'encode' ?  (
             <>
               <p>• <strong>编码模式</strong>：将任意文件隐藏到图片的Alpha通道中</p>
               <p>• 上传一张RGB图片作为载体（支持PNG/JPG/WebP等格式）</p>
-              <p>• 选择要隐藏的文件（任意格式）</p>
+              <p>• 选择要隐藏的文件（任意格式，支持大文件）</p>
               <p>• 处理后会生成一张PNG图片，包含隐藏的数据</p>
               <p>• 数据格式（Header 1068字节）：</p>
               <p className="pl-4">- 0-7字节：文件大小</p>
@@ -719,6 +945,7 @@ const ImgikaTool: React.FC = () => {
               <p className="pl-4">- 44-555字节：原始图片文件名</p>
               <p className="pl-4">- 556-1067字节：隐藏文件原始文件名</p>
               <p>• 如果原图太小，会自动调整到能容纳数据的最小尺寸（保持宽高比）</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持大文件（80MB+），不会阻塞界面</p>
             </>
           ) : (
             <>
@@ -727,13 +954,11 @@ const ImgikaTool: React.FC = () => {
               <p>• 会自动提取并下载隐藏的文件（使用原始文件名）</p>
               <p>• 同时会恢复并下载原始的RGB图片（使用原始文件名）</p>
               <p>• 会自动验证SHA256校验和以确保数据完整性</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持大文件解码</p>
             </>
           )}
         </div>
       </div>
-      
-      {/* 隐藏的Canvas元素 */}
-      <canvas ref={canvasRef} className="hidden" />
     </div>
   );
 };
