@@ -1295,7 +1295,7 @@ const ImgikaTool: React.FC = () => {
             <>
               <p>• <strong>编码模式</strong>：将任意文件隐藏到图片的Alpha通道中</p>
               <p>• 上传一张RGB图片作为载体（支持PNG/JPG/WebP等格式）</p>
-              <p>• 选择要隐藏的文件（任意格式，支持大文件）</p>
+              <p>• 选择要隐藏的文件（任意格式，支持较大文件）</p>
               <p>• 处理后会生成一张PNG图片，包含隐藏的数据</p>
               <p>• 数据格式（Header 1068字节）：</p>
                             <p className="pl-4">- 0-7字节：文件大小</p>
@@ -1304,7 +1304,7 @@ const ImgikaTool: React.FC = () => {
               <p className="pl-4">- 44-555字节：原始图片文件名</p>
               <p className="pl-4">- 556-1067字节：隐藏文件原始文件名</p>
               <p>• 如果原图太小，会自动调整到能容纳数据的最小尺寸（保持宽高比）</p>
-              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持大文件（80MB+），不会阻塞界面</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持较大文件的快速编码</p>
             </>
           ) : (
             <>
@@ -1320,7 +1320,7 @@ const ImgikaTool: React.FC = () => {
               <p className="pl-4">- 文本：TXT, MD, LOG, CSV 等</p>
               <p className="pl-4">- 代码：JS, TS, PY, JAVA, C, GO, RS, JSON, HTML, CSS 等</p>
               <p className="pl-4">- 文档：PDF</p>
-              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持大文件解码</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持较大文件的快速解码</p>
             </>
           )}
         </div>
