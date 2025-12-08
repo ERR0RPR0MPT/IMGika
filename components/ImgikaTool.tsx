@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, DragEvent } from 'react';
 
 const ImgikaTool: React.FC = () => {
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -7,10 +7,21 @@ const ImgikaTool: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [mode, setMode] = useState<'encode' | 'decode'>('encode');
+  const [imageDragActive, setImageDragActive] = useState(false);
+  const [dataDragActive, setDataDragActive] = useState(false);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const dataInputRef = useRef<HTMLInputElement>(null);
+
+  // Header 常量定义
+  const HEADER_SIZE = 1068; // 总 header 大小
+  const FILE_SIZE_OFFSET = 0;       // 0-7: 文件大小 (8字节)
+  const ORIGINAL_WIDTH_OFFSET = 8;  // 8-11: 原始宽度 (4字节)
+  const SHA256_OFFSET = 12;         // 12-43: SHA256 (32字节)
+  const IMAGE_FILENAME_OFFSET = 44; // 44-555: 图片文件名 (512字节)
+  const DATA_FILENAME_OFFSET = 556; // 556-1067: 数据文件名 (512字节)
+  const FILENAME_MAX_LENGTH = 512;  // 文件名最大长度
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -26,10 +37,90 @@ const ImgikaTool: React.FC = () => {
     }
   };
 
+  // 拖拽处理函数
+  const handleDragEnter = (e: DragEvent<HTMLDivElement>, type: 'image' | 'data') => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (type === 'image') {
+      setImageDragActive(true);
+    } else {
+      setDataDragActive(true);
+    }
+  };
+
+  const handleDragLeave = (e: DragEvent<HTMLDivElement>, type: 'image' | 'data') => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (type === 'image') {
+      setImageDragActive(false);
+    } else {
+      setDataDragActive(false);
+    }
+  };
+
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleImageDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setImageDragActive(false);
+    
+    if (isProcessing) return;
+    
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      if (file.type.startsWith('image/')) {
+        setImageFile(file);
+      } else {
+        alert('请拖入图片文件');
+      }
+    }
+  };
+
+  const handleDataDrop = (e: DragEvent<HTMLDivElement>) => {
+    e. preventDefault();
+    e.stopPropagation();
+    setDataDragActive(false);
+    
+    if (isProcessing) return;
+    
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      setDataFile(files[0]);
+    }
+  };
+
   // 计算SHA256
   const calculateSHA256 = async (data: Uint8Array): Promise<Uint8Array> => {
     const hashBuffer = await crypto.subtle.digest('SHA-256', data as BufferSource);
     return new Uint8Array(hashBuffer);
+  };
+
+  // 将字符串编码为固定长度的字节数组（UTF-8编码，不足部分填充0）
+  const encodeFilename = (filename: string, maxLength: number): Uint8Array => {
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(filename);
+    const result = new Uint8Array(maxLength);
+    // 复制文件名（截断如果太长）
+    const copyLength = Math.min(encoded. length, maxLength - 1); // 留一个字节给结束符
+    result.set(encoded.subarray(0, copyLength), 0);
+    // 剩余部分已经是0（Uint8Array默认填充0）
+    return result;
+  };
+
+  // 从字节数组解码文件名（UTF-8解码，遇到0结束）
+  const decodeFilename = (bytes: Uint8Array): string => {
+    // 找到第一个0字节的位置
+    let endIndex = bytes.indexOf(0);
+    if (endIndex === -1) {
+      endIndex = bytes.length;
+    }
+    const decoder = new TextDecoder('utf-8');
+    return decoder.decode(bytes.subarray(0, endIndex));
   };
 
   // 加载图片并返回ImageData
@@ -57,7 +148,7 @@ const ImgikaTool: React.FC = () => {
     
     try {
       if (mode === 'encode') {
-        if (! dataFile) {
+        if (!dataFile) {
           throw new Error('请选择要隐藏的文件');
         }
         await encodeData();
@@ -101,9 +192,8 @@ const ImgikaTool: React.FC = () => {
     setProgress(20);
     
     // 4. 计算所需空间
-    // Header: 8字节(文件大小) + 4字节(原始宽度) + 32字节(SHA256) = 44字节
-    const headerSize = 44;
-    const totalBytesNeeded = headerSize + fileBytes.length;
+    // Header: 8字节(文件大小) + 4字节(原始宽度) + 32字节(SHA256) + 512字节(图片文件名) + 512字节(数据文件名) = 1068字节
+    const totalBytesNeeded = HEADER_SIZE + fileBytes.length;
     
     // 5. 计算保持宽高比的最小尺寸
     // w * h >= totalBytesNeeded
@@ -128,13 +218,15 @@ const ImgikaTool: React.FC = () => {
     console.log(`原始尺寸: ${originalWidth}x${originalHeight}`);
     console.log(`最终尺寸: ${finalWidth}x${finalHeight}`);
     console.log(`需要像素: ${totalBytesNeeded}, 可用像素: ${finalWidth * finalHeight}`);
+    console.log(`图片文件名: ${imageFile.name}`);
+    console.log(`数据文件名: ${dataFile.name}`);
     
-    // 7. 设置画布并绘制放大后的图片
+    // 7.  设置画布并绘制放大后的图片
     canvas.width = finalWidth;
-    canvas. height = finalHeight;
+    canvas.height = finalHeight;
     
     // 绘制原图到新尺寸（可能会拉伸）
-    ctx. drawImage(img, 0, 0, finalWidth, finalHeight);
+    ctx.drawImage(img, 0, 0, finalWidth, finalHeight);
     
     setProgress(30);
     
@@ -142,26 +234,34 @@ const ImgikaTool: React.FC = () => {
     const imageData = ctx.getImageData(0, 0, finalWidth, finalHeight);
     const pixels = imageData.data;
     
-    // 9. 构建header数据 (44字节)
-    const header = new ArrayBuffer(headerSize);
+    // 9. 构建header数据 (1068字节)
+    const header = new ArrayBuffer(HEADER_SIZE);
     const headerView = new DataView(header);
+    const headerBytes = new Uint8Array(header);
     
     // 0-7: 文件大小 (8字节, 小端序)
-    headerView. setBigUint64(0, BigInt(fileBytes.length), true);
+    headerView.setBigUint64(FILE_SIZE_OFFSET, BigInt(fileBytes.length), true);
     
     // 8-11: 原始图片宽度 (4字节, 小端序)
-    headerView.setUint32(8, originalWidth, true);
+    headerView.setUint32(ORIGINAL_WIDTH_OFFSET, originalWidth, true);
     
     // 12-43: SHA256校验和 (32字节)
-    const headerBytes = new Uint8Array(header);
-    headerBytes.set(sha256, 12);
+    headerBytes.set(sha256, SHA256_OFFSET);
+    
+    // 44-555: 原始图片文件名 (512字节)
+    const imageFilenameBytes = encodeFilename(imageFile.name, FILENAME_MAX_LENGTH);
+    headerBytes.set(imageFilenameBytes, IMAGE_FILENAME_OFFSET);
+    
+    // 556-1067: 二进制数据原始文件名 (512字节)
+    const dataFilenameBytes = encodeFilename(dataFile.name, FILENAME_MAX_LENGTH);
+    headerBytes. set(dataFilenameBytes, DATA_FILENAME_OFFSET);
     
     setProgress(40);
     
-    // 10.  合并header和文件数据
-    const combinedData = new Uint8Array(headerSize + fileBytes.length);
+    // 10. 合并header和文件数据
+    const combinedData = new Uint8Array(HEADER_SIZE + fileBytes.length);
     combinedData.set(headerBytes, 0);
-    combinedData.set(fileBytes, headerSize);
+    combinedData.set(fileBytes, HEADER_SIZE);
     
     // 11. 写入Alpha通道
     // 按从上到下，从左到右的顺序（这是ImageData的默认顺序）
@@ -196,7 +296,7 @@ const ImgikaTool: React.FC = () => {
     
     setProgress(100);
     
-    alert(`文件编码成功！\n原始尺寸: ${originalWidth}x${originalHeight}\n编码后尺寸: ${finalWidth}x${finalHeight}\n隐藏数据大小: ${fileBytes. length} 字节\n请下载生成的图片。`);
+    alert(`文件编码成功！\n原始尺寸: ${originalWidth}x${originalHeight}\n编码后尺寸: ${finalWidth}x${finalHeight}\n隐藏数据大小: ${fileBytes.length} 字节\n图片文件名: ${imageFile.name}\n数据文件名: ${dataFile.name}\n请下载生成的图片。`);
   };
 
   const decodeData = async () => {
@@ -225,15 +325,13 @@ const ImgikaTool: React.FC = () => {
     const pixels = imageData.data;
     const totalPixels = img.width * img.height;
     
-    // 4. 读取header (44字节)
-    const headerSize = 44;
-    
-    if (totalPixels < headerSize) {
+    // 4. 读取header (1068字节)
+    if (totalPixels < HEADER_SIZE) {
       throw new Error('图片太小，不是有效的IMGika图片');
     }
     
-    const headerBytes = new Uint8Array(headerSize);
-    for (let i = 0; i < headerSize; i++) {
+    const headerBytes = new Uint8Array(HEADER_SIZE);
+    for (let i = 0; i < HEADER_SIZE; i++) {
       headerBytes[i] = pixels[i * 4 + 3]; // 读取每个像素的Alpha通道
     }
     
@@ -243,21 +341,31 @@ const ImgikaTool: React.FC = () => {
     const headerView = new DataView(headerBytes. buffer);
     
     // 0-7: 文件大小
-    const fileSize = Number(headerView.getBigUint64(0, true));
+    const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
     
     // 8-11: 原始图片宽度
-    const originalWidth = headerView.getUint32(8, true);
+    const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
     
     // 12-43: SHA256校验和
-    const storedSHA256 = headerBytes.slice(12, 44);
+    const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
+    
+    // 44-555: 原始图片文件名
+    const imageFilenameBytes = headerBytes.slice(IMAGE_FILENAME_OFFSET, IMAGE_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+    const originalImageFilename = decodeFilename(imageFilenameBytes) || 'original_image.png';
+    
+    // 556-1067: 二进制数据原始文件名
+    const dataFilenameBytes = headerBytes.slice(DATA_FILENAME_OFFSET, DATA_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+    const originalDataFilename = decodeFilename(dataFilenameBytes) || 'extracted_file.bin';
     
     console.log('解析header:');
     console.log('文件大小:', fileSize);
     console.log('原始宽度:', originalWidth);
     console.log('SHA256:', Array.from(storedSHA256).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log('原始图片文件名:', originalImageFilename);
+    console. log('原始数据文件名:', originalDataFilename);
     
     // 6. 验证文件大小
-    const maxFileSize = totalPixels - headerSize;
+    const maxFileSize = totalPixels - HEADER_SIZE;
     if (fileSize <= 0 || fileSize > maxFileSize) {
       throw new Error(`无效的文件大小 (${fileSize})，可能不是有效的IMGika图片。最大可存储: ${maxFileSize} 字节`);
     }
@@ -267,7 +375,7 @@ const ImgikaTool: React.FC = () => {
     // 7. 提取文件数据
     const fileData = new Uint8Array(fileSize);
     for (let i = 0; i < fileSize; i++) {
-      const pixelIndex = (i + headerSize) * 4;
+      const pixelIndex = (i + HEADER_SIZE) * 4;
       fileData[i] = pixels[pixelIndex + 3]; // 读取Alpha通道
       
       // 更新进度
@@ -289,7 +397,7 @@ const ImgikaTool: React.FC = () => {
       }
     }
     
-    console.log('计算的SHA256:', Array.from(calculatedSHA256).map(b => b.toString(16).padStart(2, '0')). join(''));
+    console.log('计算的SHA256:', Array.from(calculatedSHA256).map(b => b.toString(16).padStart(2, '0')).join(''));
     console.log('SHA256校验:', sha256Match ? '通过' : '失败');
     
     if (!sha256Match) {
@@ -301,12 +409,12 @@ const ImgikaTool: React.FC = () => {
     
     setProgress(85);
     
-    // 9. 下载提取的文件
+    // 9. 下载提取的文件（使用原始文件名）
     const blob = new Blob([fileData]);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'extracted_file.bin';
+    a.download = originalDataFilename; // 使用从header中提取的原始文件名
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -333,7 +441,7 @@ const ImgikaTool: React.FC = () => {
       
       // 获取像素数据并设置Alpha为255（完全不透明）
       const originalImageData = originalCtx.getImageData(0, 0, originalWidth, originalHeight);
-      const originalPixels = originalImageData. data;
+      const originalPixels = originalImageData.data;
       
       for (let i = 0; i < originalPixels.length; i += 4) {
         originalPixels[i + 3] = 255; // 设置Alpha为完全不透明
@@ -341,16 +449,25 @@ const ImgikaTool: React.FC = () => {
       
       originalCtx.putImageData(originalImageData, 0, 0);
       
-      // 下载原始图片
+      // 下载原始图片（使用从header中提取的原始文件名）
+      // 确保文件扩展名为.png（因为我们输出的是PNG格式）
+      let outputImageFilename = originalImageFilename;
+      const lastDotIndex = outputImageFilename.lastIndexOf('.');
+      if (lastDotIndex > 0) {
+        outputImageFilename = outputImageFilename.substring(0, lastDotIndex) + '.png';
+      } else {
+        outputImageFilename = outputImageFilename + '.png';
+      }
+      
       originalCanvas.toBlob((blob) => {
         if (blob) {
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = 'original_image.png';
-          document.body.appendChild(a);
+          a.download = outputImageFilename; // 使用从header中提取的原始图片文件名
+          document. body.appendChild(a);
           a.click();
-          document.body.removeChild(a);
+          document. body.removeChild(a);
           URL.revokeObjectURL(url);
         }
       }, 'image/png');
@@ -358,7 +475,7 @@ const ImgikaTool: React.FC = () => {
     
     setProgress(100);
     
-    alert(`文件解码成功！\n- 隐藏的文件已下载为 "extracted_file.bin" (${fileSize} 字节)\n- 原始图片已下载为 "original_image. png" (${originalWidth}x${originalHeight})\nSHA256校验: ${sha256Match ? '通过 ✓' : '失败 ✗'}`);
+    alert(`文件解码成功！\n- 隐藏的文件已下载为 "${originalDataFilename}" (${fileSize} 字节)\n- 原始图片已下载为 "${originalImageFilename. replace(/\.[^. ]+$/, '. png')}" (${originalWidth}x${originalHeight})\nSHA256校验: ${sha256Match ? '通过 ✓' : '失败 ✗'}`);
   };
 
   const resetAll = () => {
@@ -366,6 +483,8 @@ const ImgikaTool: React.FC = () => {
     setDataFile(null);
     setProcessedImage(null);
     setProgress(0);
+    setImageDragActive(false);
+    setDataDragActive(false);
     if (imageInputRef.current) {
       imageInputRef.current.value = '';
     }
@@ -417,7 +536,17 @@ const ImgikaTool: React.FC = () => {
           <h3 className="text-xl font-semibold mb-4 text-[var(--md-sys-color-on-surface)]">
             {mode === 'encode' ? '1. 选择载体图片' : '1. 选择含数据的图片'}
           </h3>
-          <div className="border-2 border-dashed border-[var(--md-sys-color-outline)] rounded-xl p-8 text-center hover:border-[var(--md-sys-color-primary)] transition-colors">
+          <div 
+            className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+              imageDragActive 
+                ? 'border-[var(--md-sys-color-primary)] bg-[var(--md-sys-color-primary)]/10' 
+                : 'border-[var(--md-sys-color-outline)] hover:border-[var(--md-sys-color-primary)]'
+            }`}
+            onDragEnter={(e) => handleDragEnter(e, 'image')}
+            onDragLeave={(e) => handleDragLeave(e, 'image')}
+            onDragOver={handleDragOver}
+            onDrop={handleImageDrop}
+          >
             <input
               type="file"
               accept="image/*"
@@ -426,13 +555,21 @@ const ImgikaTool: React.FC = () => {
               ref={imageInputRef}
               disabled={isProcessing}
             />
-            <button
-              className="px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium hover:shadow-lg transition-shadow disabled:opacity-50"
-              onClick={() => imageInputRef.current?.click()}
-              disabled={isProcessing}
-            >
-              选择图片
-            </button>
+            <div className="flex flex-col items-center gap-3">
+              <div className="text-4xl mb-2">
+                {imageDragActive ? '📥' : '🖼️'}
+              </div>
+              <button
+                className="px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium hover:shadow-lg transition-shadow disabled:opacity-50"
+                onClick={() => imageInputRef.current?.click()}
+                disabled={isProcessing}
+              >
+                选择图片
+              </button>
+              <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                或将图片拖拽到此区域
+              </p>
+            </div>
             {imageFile && (
               <div className="mt-4">
                 <p className="text-[var(--md-sys-color-on-surface-variant)] break-all">
@@ -452,7 +589,17 @@ const ImgikaTool: React.FC = () => {
             <h3 className="text-xl font-semibold mb-4 text-[var(--md-sys-color-on-surface)]">
               2. 选择要隐藏的文件
             </h3>
-            <div className="border-2 border-dashed border-[var(--md-sys-color-outline)] rounded-xl p-8 text-center hover:border-[var(--md-sys-color-primary)] transition-colors">
+            <div 
+              className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+                dataDragActive 
+                  ?  'border-[var(--md-sys-color-primary)] bg-[var(--md-sys-color-primary)]/10' 
+                  : 'border-[var(--md-sys-color-outline)] hover:border-[var(--md-sys-color-primary)]'
+              }`}
+              onDragEnter={(e) => handleDragEnter(e, 'data')}
+              onDragLeave={(e) => handleDragLeave(e, 'data')}
+              onDragOver={handleDragOver}
+              onDrop={handleDataDrop}
+            >
               <input
                 type="file"
                 onChange={handleDataUpload}
@@ -461,12 +608,20 @@ const ImgikaTool: React.FC = () => {
                 ref={dataInputRef}
                 disabled={isProcessing}
               />
-              <label
-                htmlFor="data-file-input"
-                className="px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium cursor-pointer inline-block hover:shadow-lg transition-shadow"
-              >
-                选择文件
-              </label>
+              <div className="flex flex-col items-center gap-3">
+                <div className="text-4xl mb-2">
+                  {dataDragActive ?  '📥' : '📄'}
+                </div>
+                <label
+                  htmlFor="data-file-input"
+                  className={`px-6 py-3 rounded-full bg-[var(--md-sys-color-secondary-container)] text-[var(--md-sys-color-on-secondary-container)] font-medium cursor-pointer inline-block hover:shadow-lg transition-shadow ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  选择文件
+                </label>
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                  或将文件拖拽到此区域
+                </p>
+              </div>
               {dataFile && (
                 <div className="mt-4">
                   <p className="text-[var(--md-sys-color-on-surface-variant)] break-all">
@@ -491,7 +646,7 @@ const ImgikaTool: React.FC = () => {
               : 'bg-[var(--md-sys-color-primary)] text-[var(--md-sys-color-on-primary)] hover:shadow-xl'
           } disabled:opacity-50 disabled:cursor-not-allowed`}
           onClick={handleProcess}
-          disabled={isProcessing || !imageFile || (mode === 'encode' && ! dataFile)}
+          disabled={isProcessing || ! imageFile || (mode === 'encode' && ! dataFile)}
         >
           {isProcessing ? (
             <>
@@ -531,12 +686,6 @@ const ImgikaTool: React.FC = () => {
             处理结果
           </h3>
           <div className="bg-[var(--md-sys-color-surface)] p-4 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
-            {/* <img
-              src={processedImage}
-              alt="处理后的图片"
-              className="max-w-full h-auto rounded-lg mx-auto"
-              style={{ maxHeight: '500px' }}
-            /> */}
             <div className="mt-4 flex justify-center">
               <a
                 href={processedImage}
@@ -563,15 +712,20 @@ const ImgikaTool: React.FC = () => {
               <p>• 上传一张RGB图片作为载体（支持PNG/JPG/WebP等格式）</p>
               <p>• 选择要隐藏的文件（任意格式）</p>
               <p>• 处理后会生成一张PNG图片，包含隐藏的数据</p>
-              <p>• 数据格式：8字节文件大小 + 4字节原始宽度 + 32字节SHA256 + 文件数据</p>
+              <p>• 数据格式（Header 1068字节）：</p>
+              <p className="pl-4">- 0-7字节：文件大小</p>
+              <p className="pl-4">- 8-11字节：原始图片宽度</p>
+              <p className="pl-4">- 12-43字节：SHA256校验和</p>
+              <p className="pl-4">- 44-555字节：原始图片文件名</p>
+              <p className="pl-4">- 556-1067字节：隐藏文件原始文件名</p>
               <p>• 如果原图太小，会自动调整到能容纳数据的最小尺寸（保持宽高比）</p>
             </>
           ) : (
             <>
               <p>• <strong>解码模式</strong>：从编码后的图片中提取隐藏的文件</p>
               <p>• 上传使用IMGika编码的PNG图片</p>
-              <p>• 会自动提取并下载隐藏的文件</p>
-              <p>• 同时会恢复并下载原始的RGB图片</p>
+              <p>• 会自动提取并下载隐藏的文件（使用原始文件名）</p>
+              <p>• 同时会恢复并下载原始的RGB图片（使用原始文件名）</p>
               <p>• 会自动验证SHA256校验和以确保数据完整性</p>
             </>
           )}
