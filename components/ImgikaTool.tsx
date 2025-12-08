@@ -2,18 +2,199 @@ import React, { useState, useRef, DragEvent, useCallback, useEffect } from 'reac
 
 // Worker 代码作为字符串
 const workerCode = `
-const HEADER_SIZE = 1068;
+const HEADER_SIZE = 1092; // 增加了压缩和加密标志位
 const FILE_SIZE_OFFSET = 0;
 const ORIGINAL_WIDTH_OFFSET = 8;
 const SHA256_OFFSET = 12;
 const IMAGE_FILENAME_OFFSET = 44;
 const DATA_FILENAME_OFFSET = 556;
 const FILENAME_MAX_LENGTH = 512;
+const FLAGS_OFFSET = 1068; // 新增：标志位偏移
+const ORIGINAL_SIZE_OFFSET = 1072; // 新增：原始文件大小（压缩前）
+const IV_OFFSET = 1080; // 新增：加密IV（12字节）
+
+// 标志位
+const FLAG_COMPRESSED = 0x01;
+const FLAG_ENCRYPTED = 0x02;
+
+// OPFS 相关
+let opfsRoot = null;
+let tempFileCounter = 0;
+
+async function getOPFSRoot() {
+  if (! opfsRoot) {
+    opfsRoot = await navigator.storage.getDirectory();
+  }
+  return opfsRoot;
+}
+
+async function createTempFile(name) {
+  const root = await getOPFSRoot();
+  const fileName = 'imgika_temp_' + Date.now() + '_' + (tempFileCounter++) + '_' + name;
+  const fileHandle = await root.getFileHandle(fileName, { create: true });
+  return { fileHandle, fileName };
+}
+
+async function deleteTempFile(fileName) {
+  try {
+    const root = await getOPFSRoot();
+    await root.removeEntry(fileName);
+  } catch (e) {
+    console.warn('Failed to delete temp file:', fileName, e);
+  }
+}
+
+async function writeToTempFile(fileHandle, data) {
+  const writable = await fileHandle.createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+
+async function readFromTempFile(fileHandle) {
+  const file = await fileHandle.getFile();
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+async function readFromTempFileChunked(fileHandle, start, end) {
+  const file = await fileHandle.getFile();
+  const slice = file.slice(start, end);
+  return new Uint8Array(await slice.arrayBuffer());
+}
+
+async function getTempFileSize(fileHandle) {
+  const file = await fileHandle.getFile();
+  return file.size;
+}
 
 // 计算SHA256
 async function calculateSHA256(data) {
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   return new Uint8Array(hashBuffer);
+}
+
+// 分块计算SHA256
+async function calculateSHA256Chunked(fileHandle, chunkSize = 10 * 1024 * 1024) {
+  const size = await getTempFileSize(fileHandle);
+  // 对于小文件，直接计算
+  if (size <= chunkSize) {
+    const data = await readFromTempFile(fileHandle);
+    return calculateSHA256(data);
+  }
+  
+  // 对于大文件，需要读取全部数据（Web Crypto API 不支持流式哈希）
+  const data = await readFromTempFile(fileHandle);
+  return calculateSHA256(data);
+}
+
+// 压缩数据
+async function compressData(data) {
+  const stream = new Blob([data]).stream();
+  const compressedStream = stream.pipeThrough(new CompressionStream('gzip'));
+  const reader = compressedStream.getReader();
+  const chunks = [];
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  
+  return result;
+}
+
+// 解压数据
+async function decompressData(data) {
+  const stream = new Blob([data]).stream();
+  const decompressedStream = stream.pipeThrough(new DecompressionStream('gzip'));
+  const reader = decompressedStream.getReader();
+  const chunks = [];
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  
+  return result;
+}
+
+// 从密码派生密钥
+async function deriveKey(password) {
+  const encoder = new TextEncoder();
+  const passwordData = encoder.encode(password);
+  
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    passwordData,
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  
+  // 使用固定的盐值（实际应用中应该随机生成并存储）
+  const salt = new Uint8Array([73, 77, 71, 105, 107, 97, 83, 97, 108, 116, 50, 48, 50, 52, 33, 33]);
+  
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: 100000,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+// 加密数据
+async function encryptData(data, password) {
+  const key = await deriveKey(password);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  
+  const encryptedData = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv },
+    key,
+    data
+  );
+  
+  return {
+    encrypted: new Uint8Array(encryptedData),
+    iv: iv
+  };
+}
+
+// 解密数据
+async function decryptData(data, password, iv) {
+  const key = await deriveKey(password);
+  
+  try {
+    const decryptedData = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv },
+      key,
+      data
+    );
+    return new Uint8Array(decryptedData);
+  } catch (e) {
+    throw new Error('解密失败：密码错误或数据已损坏');
+  }
 }
 
 // 编码文件名
@@ -50,300 +231,487 @@ async function processChunked(totalIterations, chunkSize, processFunc, progressC
 }
 
 // 编码处理
-async function encodeImage(imageData, imgWidth, imgHeight, fileData, imageFilename, dataFilename) {
-  // 确保宽高是有效的正整数
-  const originalWidth = Math.max(1, Math.floor(Number(imgWidth) || 1));
-  const originalHeight = Math.max(1, Math.floor(Number(imgHeight) || 1));
-  const aspectRatio = originalWidth / originalHeight;
+async function encodeImage(imageData, imgWidth, imgHeight, fileData, imageFilename, dataFilename, options = {}) {
+  const { compress = false, encrypt = false, password = '' } = options;
+  const tempFiles = [];
   
-  self.postMessage({ type: 'progress', progress: 10 });
-  self.postMessage({ 
-    type: 'log', 
-    message: 'encodeImage called with width=' + originalWidth + ', height=' + originalHeight
-  });
-  
-  // 计算SHA256
-  const fileBytes = new Uint8Array(fileData);
-  const sha256 = await calculateSHA256(fileBytes);
-  
-  self.postMessage({ type: 'progress', progress: 20 });
-  
-  // 计算所需空间
-  const totalBytesNeeded = HEADER_SIZE + fileBytes.length;
-  
-  // 计算保持宽高比的最小尺寸
-  let finalHeight = Math.max(1, Math.ceil(Math.sqrt(totalBytesNeeded / aspectRatio)));
-  let finalWidth = Math.max(1, Math.ceil(finalHeight * aspectRatio));
-  
-  // 确保是整数
-  finalWidth = Math.floor(finalWidth);
-  finalHeight = Math.floor(finalHeight);
-  
-  while (finalWidth * finalHeight < totalBytesNeeded) {
-    finalHeight++;
-    finalWidth = Math.max(1, Math.floor(Math.ceil(finalHeight * aspectRatio)));
-  }
-  
-  // 如果原图已经足够大，使用原图尺寸
-  if (originalWidth * originalHeight >= totalBytesNeeded) {
-    finalWidth = originalWidth;
-    finalHeight = originalHeight;
-  }
-  
-  // 再次确保是有效的正整数
-  finalWidth = Math.max(1, Math.floor(finalWidth));
-  finalHeight = Math.max(1, Math.floor(finalHeight));
-  
-  self.postMessage({ type: 'progress', progress: 25 });
-  self.postMessage({ 
-    type: 'log', 
-    message: 'Original: ' + originalWidth + 'x' + originalHeight + ', Final: ' + finalWidth + 'x' + finalHeight
-  });
-  
-  // 创建 OffscreenCanvas
-  let canvas;
   try {
-    canvas = new OffscreenCanvas(finalWidth, finalHeight);
-  } catch (e) {
-    throw new Error('Failed to create OffscreenCanvas: width=' + finalWidth + ', height=' + finalHeight + ', error=' + e.message);
-  }
-  
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('Failed to get 2d context');
-  }
-  
-  // 创建 ImageBitmap 并绘制
-  const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
-  const imageBitmap = await createImageBitmap(blob);
-  ctx.drawImage(imageBitmap, 0, 0, finalWidth, finalHeight);
-  imageBitmap.close();
-  
-  self.postMessage({ type: 'progress', progress: 35 });
-  
-  // 获取像素数据
-  const resultImageData = ctx.getImageData(0, 0, finalWidth, finalHeight);
-  const pixels = resultImageData.data;
-  
-  // 构建header
-  const header = new ArrayBuffer(HEADER_SIZE);
-  const headerView = new DataView(header);
-  const headerBytes = new Uint8Array(header);
-  
-  headerView.setBigUint64(FILE_SIZE_OFFSET, BigInt(fileBytes.length), true);
-  headerView.setUint32(ORIGINAL_WIDTH_OFFSET, originalWidth, true);
-  headerBytes.set(sha256, SHA256_OFFSET);
-  headerBytes.set(encodeFilename(imageFilename, FILENAME_MAX_LENGTH), IMAGE_FILENAME_OFFSET);
-  headerBytes.set(encodeFilename(dataFilename, FILENAME_MAX_LENGTH), DATA_FILENAME_OFFSET);
-  
-  // 合并数据
-  const combinedData = new Uint8Array(HEADER_SIZE + fileBytes.length);
-  combinedData.set(headerBytes, 0);
-  combinedData.set(fileBytes, HEADER_SIZE);
-  
-  self.postMessage({ type: 'progress', progress: 40 });
-  
-  // 分块写入Alpha通道
-  const totalPixels = finalWidth * finalHeight;
-  const CHUNK_SIZE = 100000;
-  
-  await processChunked(totalPixels, CHUNK_SIZE, async (start, end) => {
-    for (let i = start; i < end; i++) {
-      const pixelIndex = i * 4;
-      if (i < combinedData.length) {
-        pixels[pixelIndex + 3] = combinedData[i];
-      } else {
-        pixels[pixelIndex + 3] = 255;
-      }
+    // 确保宽高是有效的正整数
+    const originalWidth = Math.max(1, Math.floor(Number(imgWidth) || 1));
+    const originalHeight = Math.max(1, Math.floor(Number(imgHeight) || 1));
+    const aspectRatio = originalWidth / originalHeight;
+    
+    self.postMessage({ type: 'progress', progress: 5 });
+    self.postMessage({ 
+      type: 'log', 
+      message: 'encodeImage called with width=' + originalWidth + ', height=' + originalHeight
+    });
+    
+    // 将原始文件数据写入临时文件
+    let fileBytes = new Uint8Array(fileData);
+    const originalFileSize = fileBytes.length;
+    
+    self.postMessage({ type: 'progress', progress: 8 });
+    self.postMessage({ type: 'log', message: 'Original file size: ' + originalFileSize });
+    
+    // 压缩处理
+    if (compress) {
+      self.postMessage({ type: 'log', message: 'Compressing data...' });
+      self.postMessage({ type: 'progress', progress: 10 });
+      fileBytes = await compressData(fileBytes);
+      self.postMessage({ type: 'log', message: 'Compressed size: ' + fileBytes.length + ' (ratio: ' + (fileBytes.length / originalFileSize * 100).toFixed(1) + '%)' });
     }
-  }, (progress) => {
-    self.postMessage({ type: 'progress', progress: 40 + Math.round(progress * 50) });
-  });
-  
-  ctx.putImageData(resultImageData, 0, 0);
-  
-  self.postMessage({ type: 'progress', progress: 95 });
-  
-  // 转换为Blob
-  const resultBlob = await canvas.convertToBlob({ type: 'image/png' });
-  const arrayBuffer = await resultBlob.arrayBuffer();
-  
-  self.postMessage({ type: 'progress', progress: 100 });
-  
-  return {
-    data: new Uint8Array(arrayBuffer),
-    originalWidth,
-    originalHeight,
-    finalWidth,
-    finalHeight,
-    fileSize: fileBytes.length,
-    imageFilename,
-    dataFilename
-  };
+    
+    self.postMessage({ type: 'progress', progress: 15 });
+    
+    // 加密处理
+    let iv = new Uint8Array(12);
+    if (encrypt) {
+      if (! password) {
+        throw new Error('加密需要提供密码');
+      }
+      self.postMessage({ type: 'log', message: 'Encrypting data...' });
+      self.postMessage({ type: 'progress', progress: 18 });
+      const encryptResult = await encryptData(fileBytes, password);
+      fileBytes = encryptResult.encrypted;
+      iv = encryptResult.iv;
+      self.postMessage({ type: 'log', message: 'Encryption complete' });
+    }
+    
+    self.postMessage({ type: 'progress', progress: 20 });
+    
+    // 将处理后的数据写入临时文件
+    const { fileHandle: dataFileHandle, fileName: dataFileName } = await createTempFile('data');
+    tempFiles.push(dataFileName);
+    await writeToTempFile(dataFileHandle, fileBytes);
+    
+    // 计算SHA256
+    const sha256 = await calculateSHA256(fileBytes);
+    
+    self.postMessage({ type: 'progress', progress: 25 });
+    
+    // 计算所需空间
+    const processedFileSize = fileBytes.length;
+    const totalBytesNeeded = HEADER_SIZE + processedFileSize;
+    
+    // 计算保持宽高比的最小尺寸
+    let finalHeight = Math.max(1, Math.ceil(Math.sqrt(totalBytesNeeded / aspectRatio)));
+    let finalWidth = Math.max(1, Math.ceil(finalHeight * aspectRatio));
+    
+    // 确保是整数
+    finalWidth = Math.floor(finalWidth);
+    finalHeight = Math.floor(finalHeight);
+    
+    while (finalWidth * finalHeight < totalBytesNeeded) {
+      finalHeight++;
+      finalWidth = Math.max(1, Math.floor(Math.ceil(finalHeight * aspectRatio)));
+    }
+    
+    // 如果原图已经足够大，使用原图尺寸
+    if (originalWidth * originalHeight >= totalBytesNeeded) {
+      finalWidth = originalWidth;
+      finalHeight = originalHeight;
+    }
+    
+    // 再次确保是有效的正整数
+    finalWidth = Math.max(1, Math.floor(finalWidth));
+    finalHeight = Math.max(1, Math.floor(finalHeight));
+    
+    // 检查尺寸是否有效
+    if (finalWidth <= 0 || finalHeight <= 0 || ! Number.isFinite(finalWidth) || !Number.isFinite(finalHeight)) {
+      throw new Error('计算的图片尺寸无效: width=' + finalWidth + ', height=' + finalHeight);
+    }
+    
+    // 检查是否超过浏览器限制（通常最大为 32767x32767 或更小）
+    const MAX_CANVAS_SIZE = 16384;
+    if (finalWidth > MAX_CANVAS_SIZE || finalHeight > MAX_CANVAS_SIZE) {
+      throw new Error('所需图片尺寸 (' + finalWidth + 'x' + finalHeight + ') 超过浏览器限制 (' + MAX_CANVAS_SIZE + 'x' + MAX_CANVAS_SIZE + ')。请使用更大的载体图片或更小的数据文件。');
+    }
+    
+    self.postMessage({ type: 'progress', progress: 30 });
+    self.postMessage({ 
+      type: 'log', 
+      message: 'Original: ' + originalWidth + 'x' + originalHeight + ', Final: ' + finalWidth + 'x' + finalHeight
+    });
+    
+    // 创建 OffscreenCanvas
+    let canvas;
+    try {
+      canvas = new OffscreenCanvas(finalWidth, finalHeight);
+    } catch (e) {
+      throw new Error('Failed to create OffscreenCanvas: width=' + finalWidth + ', height=' + finalHeight + ', error=' + e.message);
+    }
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      throw new Error('Failed to get 2d context');
+    }
+    
+    // 创建 ImageBitmap 并绘制
+    const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+    const imageBitmap = await createImageBitmap(blob);
+    ctx.drawImage(imageBitmap, 0, 0, finalWidth, finalHeight);
+    imageBitmap.close();
+    
+    self.postMessage({ type: 'progress', progress: 40 });
+    
+    // 获取像素数据
+    const resultImageData = ctx.getImageData(0, 0, finalWidth, finalHeight);
+    const pixels = resultImageData.data;
+    
+    // 构建header
+    const header = new ArrayBuffer(HEADER_SIZE);
+    const headerView = new DataView(header);
+    const headerBytes = new Uint8Array(header);
+    
+    // 写入处理后的文件大小
+    headerView.setBigUint64(FILE_SIZE_OFFSET, BigInt(processedFileSize), true);
+    headerView.setUint32(ORIGINAL_WIDTH_OFFSET, originalWidth, true);
+    headerBytes.set(sha256, SHA256_OFFSET);
+    headerBytes.set(encodeFilename(imageFilename, FILENAME_MAX_LENGTH), IMAGE_FILENAME_OFFSET);
+    headerBytes.set(encodeFilename(dataFilename, FILENAME_MAX_LENGTH), DATA_FILENAME_OFFSET);
+    
+    // 写入标志位
+    let flags = 0;
+    if (compress) flags |= FLAG_COMPRESSED;
+    if (encrypt) flags |= FLAG_ENCRYPTED;
+    headerView.setUint32(FLAGS_OFFSET, flags, true);
+    
+    // 写入原始文件大小
+    headerView.setBigUint64(ORIGINAL_SIZE_OFFSET, BigInt(originalFileSize), true);
+    
+    // 写入加密IV
+    headerBytes.set(iv, IV_OFFSET);
+    
+    self.postMessage({ type: 'progress', progress: 45 });
+    
+    // 写入header到Alpha通道
+    for (let i = 0; i < HEADER_SIZE; i++) {
+      pixels[i * 4 + 3] = headerBytes[i];
+    }
+    
+    self.postMessage({ type: 'progress', progress: 50 });
+    
+    // 从临时文件分块读取数据并写入Alpha通道
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    let bytesWritten = 0;
+    
+    while (bytesWritten < processedFileSize) {
+      const chunkEnd = Math.min(bytesWritten + CHUNK_SIZE, processedFileSize);
+      const chunk = await readFromTempFileChunked(dataFileHandle, bytesWritten, chunkEnd);
+      
+      for (let i = 0; i < chunk.length; i++) {
+        const pixelIndex = (HEADER_SIZE + bytesWritten + i) * 4;
+        pixels[pixelIndex + 3] = chunk[i];
+      }
+      
+      bytesWritten = chunkEnd;
+      const progress = 50 + Math.round((bytesWritten / processedFileSize) * 35);
+      self.postMessage({ type: 'progress', progress: progress });
+      
+      // 让出控制权
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    
+    // 填充剩余像素的Alpha通道
+    const totalPixels = finalWidth * finalHeight;
+    for (let i = HEADER_SIZE + processedFileSize; i < totalPixels; i++) {
+      pixels[i * 4 + 3] = 255;
+    }
+    
+    self.postMessage({ type: 'progress', progress: 88 });
+    
+    ctx.putImageData(resultImageData, 0, 0);
+    
+    self.postMessage({ type: 'progress', progress: 90 });
+    
+    // 验证canvas尺寸
+    if (canvas.width <= 0 || canvas.height <= 0) {
+      throw new Error('Canvas尺寸无效: ' + canvas.width + 'x' + canvas.height);
+    }
+    
+    // 转换为Blob
+    const resultBlob = await canvas.convertToBlob({ type: 'image/png' });
+    const arrayBuffer = await resultBlob.arrayBuffer();
+    
+    self.postMessage({ type: 'progress', progress: 98 });
+    
+    // 清理临时文件
+    for (const fileName of tempFiles) {
+      await deleteTempFile(fileName);
+    }
+    
+    self.postMessage({ type: 'progress', progress: 100 });
+    
+    return {
+      data: new Uint8Array(arrayBuffer),
+      originalWidth,
+      originalHeight,
+      finalWidth,
+      finalHeight,
+      fileSize: processedFileSize,
+      originalFileSize,
+      imageFilename,
+      dataFilename,
+      compressed: compress,
+      encrypted: encrypt
+    };
+  } catch (error) {
+    // 清理临时文件
+    for (const fileName of tempFiles) {
+      await deleteTempFile(fileName);
+    }
+    throw error;
+  }
 }
 
 // 解码处理
-async function decodeImage(imageData) {
-  self.postMessage({ type: 'progress', progress: 5 });
+async function decodeImage(imageData, options = {}) {
+  const { password = '' } = options;
+  const tempFiles = [];
   
-  // 创建 ImageBitmap
-  const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
-  const imageBitmap = await createImageBitmap(blob);
-  
-  const width = Math.max(1, Math.floor(imageBitmap.width));
-  const height = Math.max(1, Math.floor(imageBitmap.height));
-  
-  self.postMessage({ type: 'progress', progress: 15 });
-  self.postMessage({ type: 'log', message: 'Decoding image: ' + width + 'x' + height });
-  
-  // 创建 OffscreenCanvas
-  let canvas;
   try {
-    canvas = new OffscreenCanvas(width, height);
-  } catch (e) {
-    imageBitmap.close();
-    throw new Error('Failed to create OffscreenCanvas: width=' + width + ', height=' + height + ', error=' + e.message);
-  }
-  
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    imageBitmap.close();
-    throw new Error('Failed to get 2d context');
-  }
-  
-  ctx.drawImage(imageBitmap, 0, 0);
-  imageBitmap.close();
-  
-  self.postMessage({ type: 'progress', progress: 25 });
-  
-  // 获取像素数据
-  const resultImageData = ctx.getImageData(0, 0, width, height);
-  const pixels = resultImageData.data;
-  const totalPixels = width * height;
-  
-  if (totalPixels < HEADER_SIZE) {
-    throw new Error('图片太小，不是有效的IMGika图片');
-  }
-  
-  // 读取header
-  const headerBytes = new Uint8Array(HEADER_SIZE);
-  for (let i = 0; i < HEADER_SIZE; i++) {
-    headerBytes[i] = pixels[i * 4 + 3];
-  }
-  
-  self.postMessage({ type: 'progress', progress: 35 });
-  
-  // 解析header
-  const headerView = new DataView(headerBytes.buffer);
-  const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
-  const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
-  const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
-  
-  const imageFilenameBytes = headerBytes.slice(IMAGE_FILENAME_OFFSET, IMAGE_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
-  const originalImageFilename = decodeFilename(imageFilenameBytes) || 'original_image.png';
-  
-  const dataFilenameBytes = headerBytes.slice(DATA_FILENAME_OFFSET, DATA_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
-  const originalDataFilename = decodeFilename(dataFilenameBytes) || 'extracted_file.bin';
-  
-  self.postMessage({ 
-    type: 'log', 
-    message: 'File size: ' + fileSize + ', Original width: ' + originalWidth + ', Image filename: ' + originalImageFilename + ', Data filename: ' + originalDataFilename
-  });
-  
-  // 验证文件大小
-  const maxFileSize = totalPixels - HEADER_SIZE;
-  if (fileSize <= 0 || fileSize > maxFileSize) {
-    throw new Error('无效的文件大小 (' + fileSize + ')，可能不是有效的IMGika图片。最大可存储: ' + maxFileSize + ' 字节');
-  }
-  
-  self.postMessage({ type: 'progress', progress: 45 });
-  
-  // 分块提取文件数据
-  const fileData = new Uint8Array(fileSize);
-  const CHUNK_SIZE = 100000;
-  
-  await processChunked(fileSize, CHUNK_SIZE, async (start, end) => {
-    for (let i = start; i < end; i++) {
-      const pixelIndex = (i + HEADER_SIZE) * 4;
-      fileData[i] = pixels[pixelIndex + 3];
+    self.postMessage({ type: 'progress', progress: 5 });
+    
+    // 创建 ImageBitmap
+    const blob = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+    const imageBitmap = await createImageBitmap(blob);
+    
+    const width = Math.max(1, Math.floor(imageBitmap.width));
+    const height = Math.max(1, Math.floor(imageBitmap.height));
+    
+    self.postMessage({ type: 'progress', progress: 15 });
+    self.postMessage({ type: 'log', message: 'Decoding image: ' + width + 'x' + height });
+    
+    // 创建 OffscreenCanvas
+    let canvas;
+    try {
+      canvas = new OffscreenCanvas(width, height);
+    } catch (e) {
+      imageBitmap.close();
+      throw new Error('Failed to create OffscreenCanvas: width=' + width + ', height=' + height + ', error=' + e.message);
     }
-  }, (progress) => {
-    self.postMessage({ type: 'progress', progress: 45 + Math.round(progress * 30) });
-  });
-  
-  self.postMessage({ type: 'progress', progress: 80 });
-  
-  // 验证SHA256
-  const calculatedSHA256 = await calculateSHA256(fileData);
-  let sha256Match = true;
-  for (let i = 0; i < 32; i++) {
-    if (storedSHA256[i] !== calculatedSHA256[i]) {
-      sha256Match = false;
-      break;
+    
+    const ctx = canvas.getContext('2d');
+    if (! ctx) {
+      imageBitmap.close();
+      throw new Error('Failed to get 2d context');
     }
+    
+    ctx.drawImage(imageBitmap, 0, 0);
+    imageBitmap.close();
+    
+    self.postMessage({ type: 'progress', progress: 25 });
+    
+    // 获取像素数据
+    const resultImageData = ctx.getImageData(0, 0, width, height);
+    const pixels = resultImageData.data;
+    const totalPixels = width * height;
+    
+    if (totalPixels < HEADER_SIZE) {
+      throw new Error('图片太小，不是有效的IMGika图片');
+    }
+    
+    // 读取header
+    const headerBytes = new Uint8Array(HEADER_SIZE);
+    for (let i = 0; i < HEADER_SIZE; i++) {
+      headerBytes[i] = pixels[i * 4 + 3];
+    }
+    
+    self.postMessage({ type: 'progress', progress: 30 });
+    
+    // 解析header
+    const headerView = new DataView(headerBytes.buffer);
+    const fileSize = Number(headerView.getBigUint64(FILE_SIZE_OFFSET, true));
+    const originalWidth = headerView.getUint32(ORIGINAL_WIDTH_OFFSET, true);
+    const storedSHA256 = headerBytes.slice(SHA256_OFFSET, SHA256_OFFSET + 32);
+    
+    const imageFilenameBytes = headerBytes.slice(IMAGE_FILENAME_OFFSET, IMAGE_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+    const originalImageFilename = decodeFilename(imageFilenameBytes) || 'original_image.png';
+    
+    const dataFilenameBytes = headerBytes.slice(DATA_FILENAME_OFFSET, DATA_FILENAME_OFFSET + FILENAME_MAX_LENGTH);
+    const originalDataFilename = decodeFilename(dataFilenameBytes) || 'extracted_file.bin';
+    
+    // 读取标志位
+    const flags = headerView.getUint32(FLAGS_OFFSET, true);
+    const isCompressed = (flags & FLAG_COMPRESSED) !== 0;
+    const isEncrypted = (flags & FLAG_ENCRYPTED) !== 0;
+    
+    // 读取原始文件大小
+    const originalFileSize = Number(headerView.getBigUint64(ORIGINAL_SIZE_OFFSET, true));
+    
+    // 读取加密IV
+    const iv = headerBytes.slice(IV_OFFSET, IV_OFFSET + 12);
+    
+    self.postMessage({ 
+      type: 'log', 
+      message: 'File size: ' + fileSize + ', Original width: ' + originalWidth + ', Image filename: ' + originalImageFilename + ', Data filename: ' + originalDataFilename + ', Compressed: ' + isCompressed + ', Encrypted: ' + isEncrypted
+    });
+    
+    // 验证文件大小
+    const maxFileSize = totalPixels - HEADER_SIZE;
+    if (fileSize <= 0 || fileSize > maxFileSize) {
+      throw new Error('无效的文件大小 (' + fileSize + ')，可能不是有效的IMGika图片。最大可存储: ' + maxFileSize + ' 字节');
+    }
+    
+    // 检查是否需要密码
+    if (isEncrypted && !password) {
+      self.postMessage({ 
+        type: 'needPassword',
+        compressed: isCompressed,
+        encrypted: isEncrypted
+      });
+      return null;
+    }
+    
+    self.postMessage({ type: 'progress', progress: 35 });
+    
+    // 创建临时文件存储提取的数据
+    const { fileHandle: extractedFileHandle, fileName: extractedFileName } = await createTempFile('extracted');
+    tempFiles.push(extractedFileName);
+    
+    // 分块提取文件数据并写入临时文件
+    const CHUNK_SIZE = 5 * 1024 * 1024;
+    let bytesExtracted = 0;
+    const chunks = [];
+    
+    while (bytesExtracted < fileSize) {
+      const chunkEnd = Math.min(bytesExtracted + CHUNK_SIZE, fileSize);
+      const chunkSize = chunkEnd - bytesExtracted;
+      const chunk = new Uint8Array(chunkSize);
+      
+      for (let i = 0; i < chunkSize; i++) {
+        const pixelIndex = (HEADER_SIZE + bytesExtracted + i) * 4;
+        chunk[i] = pixels[pixelIndex + 3];
+      }
+      
+      chunks.push(chunk);
+      bytesExtracted = chunkEnd;
+      
+      const progress = 35 + Math.round((bytesExtracted / fileSize) * 25);
+      self.postMessage({ type: 'progress', progress: progress });
+      
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    
+    // 合并所有块
+    let fileData = new Uint8Array(fileSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      fileData.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // 写入临时文件
+    await writeToTempFile(extractedFileHandle, fileData);
+    
+    self.postMessage({ type: 'progress', progress: 65 });
+    
+    // 验证SHA256
+    const calculatedSHA256 = await calculateSHA256(fileData);
+    let sha256Match = true;
+    for (let i = 0; i < 32; i++) {
+      if (storedSHA256[i] !== calculatedSHA256[i]) {
+        sha256Match = false;
+        break;
+      }
+    }
+    
+    self.postMessage({ type: 'progress', progress: 70 });
+    
+    // 解密处理（如果需要）
+    if (isEncrypted) {
+      self.postMessage({ type: 'log', message: 'Decrypting data...' });
+      fileData = await decryptData(fileData, password, iv);
+      self.postMessage({ type: 'log', message: 'Decryption complete' });
+    }
+    
+    self.postMessage({ type: 'progress', progress: 75 });
+    
+    // 解压处理（如果需要）
+    if (isCompressed) {
+      self.postMessage({ type: 'log', message: 'Decompressing data...' });
+      fileData = await decompressData(fileData);
+      self.postMessage({ type: 'log', message: 'Decompression complete, size: ' + fileData.length });
+    }
+    
+    self.postMessage({ type: 'progress', progress: 80 });
+    
+    // 恢复原始RGB图片
+    const currentAspectRatio = width / height;
+    const originalHeight = Math.max(1, Math.floor(Math.round(originalWidth / currentAspectRatio)));
+    const safeOriginalWidth = Math.max(1, Math.floor(originalWidth));
+    
+    self.postMessage({ type: 'log', message: 'Restoring original image: ' + safeOriginalWidth + 'x' + originalHeight });
+    
+    let originalCanvas;
+    try {
+      originalCanvas = new OffscreenCanvas(safeOriginalWidth, originalHeight);
+    } catch (e) {
+      throw new Error('Failed to create original OffscreenCanvas: width=' + safeOriginalWidth + ', height=' + originalHeight + ', error=' + e.message);
+    }
+    
+    const originalCtx = originalCanvas.getContext('2d');
+    if (!originalCtx) {
+      throw new Error('Failed to get original 2d context');
+    }
+    
+    // 重新创建 ImageBitmap 用于缩放
+    const blob2 = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
+    const imageBitmap2 = await createImageBitmap(blob2);
+    originalCtx.drawImage(imageBitmap2, 0, 0, safeOriginalWidth, originalHeight);
+    imageBitmap2.close();
+    
+    // 设置Alpha为255
+    const originalImageData = originalCtx.getImageData(0, 0, safeOriginalWidth, originalHeight);
+    const originalPixels = originalImageData.data;
+    
+    for (let i = 0; i < originalPixels.length; i += 4) {
+      originalPixels[i + 3] = 255;
+    }
+    
+    originalCtx.putImageData(originalImageData, 0, 0);
+    
+    const originalBlob = await originalCanvas.convertToBlob({ type: 'image/png' });
+    const originalArrayBuffer = await originalBlob.arrayBuffer();
+    
+    self.postMessage({ type: 'progress', progress: 95 });
+    
+    // 清理临时文件
+    for (const fileName of tempFiles) {
+      await deleteTempFile(fileName);
+    }
+    
+    self.postMessage({ type: 'progress', progress: 100 });
+    
+    // 处理输出文件名
+    let outputImageFilename = originalImageFilename;
+    const lastDotIndex = outputImageFilename.lastIndexOf('.');
+    if (lastDotIndex > 0) {
+      outputImageFilename = outputImageFilename.substring(0, lastDotIndex) + '.png';
+    } else {
+      outputImageFilename = outputImageFilename + '.png';
+    }
+    
+    return {
+      fileData: fileData,
+      originalImageData: new Uint8Array(originalArrayBuffer),
+      originalDataFilename,
+      outputImageFilename,
+      fileSize: fileData.length,
+      originalWidth: safeOriginalWidth,
+      originalHeight,
+      sha256Match,
+      wasCompressed: isCompressed,
+      wasEncrypted: isEncrypted
+    };
+  } catch (error) {
+    // 清理临时文件
+    for (const fileName of tempFiles) {
+      await deleteTempFile(fileName);
+    }
+    throw error;
   }
-  
-  self.postMessage({ type: 'progress', progress: 85 });
-  
-  // 恢复原始RGB图片
-  const currentAspectRatio = width / height;
-  const originalHeight = Math.max(1, Math.floor(Math.round(originalWidth / currentAspectRatio)));
-  const safeOriginalWidth = Math.max(1, Math.floor(originalWidth));
-  
-  self.postMessage({ type: 'log', message: 'Restoring original image: ' + safeOriginalWidth + 'x' + originalHeight });
-  
-  let originalCanvas;
-  try {
-    originalCanvas = new OffscreenCanvas(safeOriginalWidth, originalHeight);
-  } catch (e) {
-    throw new Error('Failed to create original OffscreenCanvas: width=' + safeOriginalWidth + ', height=' + originalHeight + ', error=' + e.message);
-  }
-  
-  const originalCtx = originalCanvas.getContext('2d');
-  if (!originalCtx) {
-    throw new Error('Failed to get original 2d context');
-  }
-  
-  // 重新创建 ImageBitmap 用于缩放
-  const blob2 = new Blob([new Uint8Array(imageData)], { type: 'image/png' });
-  const imageBitmap2 = await createImageBitmap(blob2);
-  originalCtx.drawImage(imageBitmap2, 0, 0, safeOriginalWidth, originalHeight);
-  imageBitmap2.close();
-  
-  // 设置Alpha为255
-  const originalImageData = originalCtx.getImageData(0, 0, safeOriginalWidth, originalHeight);
-  const originalPixels = originalImageData.data;
-  
-  for (let i = 0; i < originalPixels.length; i += 4) {
-    originalPixels[i + 3] = 255;
-  }
-  
-  originalCtx.putImageData(originalImageData, 0, 0);
-  
-  const originalBlob = await originalCanvas.convertToBlob({ type: 'image/png' });
-  const originalArrayBuffer = await originalBlob.arrayBuffer();
-  
-  self.postMessage({ type: 'progress', progress: 100 });
-  
-  // 处理输出文件名
-  let outputImageFilename = originalImageFilename;
-  const lastDotIndex = outputImageFilename.lastIndexOf('.');
-  if (lastDotIndex > 0) {
-    outputImageFilename = outputImageFilename.substring(0, lastDotIndex) + '.png';
-  } else {
-    outputImageFilename = outputImageFilename + '.png';
-  }
-  
-  return {
-    fileData: fileData,
-    originalImageData: new Uint8Array(originalArrayBuffer),
-    originalDataFilename,
-    outputImageFilename,
-    fileSize,
-    originalWidth: safeOriginalWidth,
-    originalHeight,
-    sha256Match
-  };
 }
 
 // 消息处理
@@ -358,15 +726,24 @@ self.onmessage = async (e) => {
         payload.imgHeight,
         payload.fileData,
         payload.imageFilename,
-        payload.dataFilename
+        payload.dataFilename,
+        {
+          compress: payload.compress || false,
+          encrypt: payload.encrypt || false,
+          password: payload.password || ''
+        }
       );
       self.postMessage({ type: 'encodeResult', result }, [result.data.buffer]);
     } else if (type === 'decode') {
-      const result = await decodeImage(payload.imageData);
-      self.postMessage({ 
-        type: 'decodeResult', 
-        result 
-      }, [result.fileData.buffer, result.originalImageData.buffer]);
+      const result = await decodeImage(payload.imageData, {
+        password: payload.password || ''
+      });
+      if (result) {
+        self.postMessage({ 
+          type: 'decodeResult', 
+          result 
+        }, [result.fileData.buffer, result.originalImageData.buffer]);
+      }
     }
   } catch (error) {
     self.postMessage({ type: 'error', error: error.message });
@@ -456,6 +833,8 @@ interface DecodeResult {
   originalWidth: number;
   originalHeight: number;
   sha256Match: boolean;
+  wasCompressed?: boolean;
+  wasEncrypted?: boolean;
 }
 
 // 预览组件
@@ -630,6 +1009,80 @@ const FilePreview: React.FC<FilePreviewProps> = ({ fileData, filename, onClose }
   );
 };
 
+// 密码输入弹窗组件
+interface PasswordModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSubmit: (password: string) => void;
+  title: string;
+  description?: string;
+}
+
+const PasswordModal: React.FC<PasswordModalProps> = ({ isOpen, onClose, onSubmit, title, description }) => {
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+
+  if (!isOpen) return null;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (password) {
+      onSubmit(password);
+      setPassword('');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-[var(--md-sys-color-surface)] rounded-3xl max-w-md w-full p-6">
+        <h3 className="text-xl font-semibold text-[var(--md-sys-color-on-surface)] mb-2">
+          {title}
+        </h3>
+        {description && (
+          <p className="text-sm text-[var(--md-sys-color-on-surface-variant)] mb-4">
+            {description}
+          </p>
+        )}
+        <form onSubmit={handleSubmit}>
+          <div className="relative mb-4">
+            <input
+              type={showPassword ? 'text' : 'password'}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="请输入密码"
+              className="w-full px-4 py-3 rounded-xl bg-[var(--md-sys-color-surface-variant)] text-[var(--md-sys-color-on-surface)] border border-[var(--md-sys-color-outline-variant)]/20 focus:outline-none focus:border-[var(--md-sys-color-primary)]"
+              autoFocus
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword(!showPassword)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--md-sys-color-on-surface-variant)]"
+            >
+              {showPassword ? '🙈' : '👁️'}
+            </button>
+          </div>
+          <div className="flex gap-3 justify-end">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-6 py-2 rounded-full bg-[var(--md-sys-color-surface-variant)] text-[var(--md-sys-color-on-surface-variant)] font-medium hover:bg-[var(--md-sys-color-outline-variant)]/30 transition-colors"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={!password}
+              className="px-6 py-2 rounded-full bg-[var(--md-sys-color-primary)] text-[var(--md-sys-color-on-primary)] font-medium hover:shadow-lg transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              确认
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 const ImgikaTool: React.FC = () => {
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [dataFile, setDataFile] = useState<File | null>(null);
@@ -639,6 +1092,16 @@ const ImgikaTool: React.FC = () => {
   const [mode, setMode] = useState<'encode' | 'decode'>('encode');
   const [imageDragActive, setImageDragActive] = useState(false);
   const [dataDragActive, setDataDragActive] = useState(false);
+  
+  // 新增：压缩和加密选项
+  const [enableCompression, setEnableCompression] = useState(false);
+  const [enableEncryption, setEnableEncryption] = useState(false);
+  const [encryptionPassword, setEncryptionPassword] = useState('');
+  const [showEncryptionPassword, setShowEncryptionPassword] = useState(false);
+  
+  // 解码时需要密码的弹窗
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [pendingDecodeImageData, setPendingDecodeImageData] = useState<ArrayBuffer | null>(null);
   
   // 解码结果状态
   const [decodeResult, setDecodeResult] = useState<DecodeResult | null>(null);
@@ -799,6 +1262,12 @@ const ImgikaTool: React.FC = () => {
   const handleProcess = async () => {
     if (!imageFile || !workerRef.current) return;
     
+    // 验证加密密码
+    if (mode === 'encode' && enableEncryption && ! encryptionPassword) {
+      alert('请输入加密密码');
+      return;
+    }
+    
     setIsProcessing(true);
     setProgress(0);
     setDecodeResult(null);
@@ -868,7 +1337,22 @@ const ImgikaTool: React.FC = () => {
           const blob = new Blob([result.data], { type: 'image/png' });
           setProcessedImage(blob);
           
-          alert(`文件编码成功！\n原始尺寸: ${result.originalWidth}x${result.originalHeight}\n编码后尺寸: ${result.finalWidth}x${result.finalHeight}\n隐藏数据大小: ${result.fileSize} 字节\n图片文件名: ${result.imageFilename}\n数据文件名: ${result.dataFilename}\n请下载生成的图片。`);
+          let alertMessage = `文件编码成功！\n原始尺寸: ${result.originalWidth}x${result.originalHeight}\n编码后尺寸: ${result.finalWidth}x${result.finalHeight}\n`;
+          
+          if (result.compressed) {
+            const ratio = (result.fileSize / result.originalFileSize * 100).toFixed(1);
+            alertMessage += `压缩: 已启用 (${result.originalFileSize} → ${result.fileSize} 字节, ${ratio}%)\n`;
+          } else {
+            alertMessage += `隐藏数据大小: ${result.fileSize} 字节\n`;
+          }
+          
+          if (result.encrypted) {
+            alertMessage += `加密: 已启用\n`;
+          }
+          
+          alertMessage += `图片文件名: ${result.imageFilename}\n数据文件名: ${result.dataFilename}\n请下载生成的图片。`;
+          
+          alert(alertMessage);
           
           resolve();
         } else if (type === 'error') {
@@ -892,13 +1376,16 @@ const ImgikaTool: React.FC = () => {
           imgHeight: Math.floor(imgHeight),
           fileData: fileDataCopy,
           imageFilename: imageFile.name,
-          dataFilename: dataFile.name
+          dataFilename: dataFile.name,
+          compress: enableCompression,
+          encrypt: enableEncryption,
+          password: encryptionPassword
         }
       }, [imageDataCopy, fileDataCopy]);
     });
   };
 
-  const decodeData = async () => {
+  const decodeData = async (providedPassword?: string) => {
     if (!imageFile || !workerRef.current) return;
     
     const worker = workerRef.current;
@@ -908,6 +1395,10 @@ const ImgikaTool: React.FC = () => {
       setProgress(Math.round(p * 5));
     });
     
+    // 保存用于可能需要重试的情况（创建两份副本）
+    const imageDataBuffer = imageData.slice().buffer;
+    const imageDataBufferForRetry = imageData.slice().buffer; // 用于密码重试的备份
+    
     return new Promise<void>((resolve, reject) => {
       const handleMessage = (e: MessageEvent) => {
         const { type, progress: workerProgress, result, error, message } = e.data;
@@ -916,6 +1407,13 @@ const ImgikaTool: React.FC = () => {
           setProgress(workerProgress);
         } else if (type === 'log') {
           console.log('Worker:', message);
+        } else if (type === 'needPassword') {
+          // 需要密码，显示密码输入弹窗
+          worker.removeEventListener('message', handleMessage);
+          setPendingDecodeImageData(imageDataBufferForRetry);
+          setShowPasswordModal(true);
+          setIsProcessing(false);
+          resolve();
         } else if (type === 'decodeResult') {
           worker.removeEventListener('message', handleMessage);
           
@@ -928,7 +1426,9 @@ const ImgikaTool: React.FC = () => {
             fileSize: result.fileSize,
             originalWidth: result.originalWidth,
             originalHeight: result.originalHeight,
-            sha256Match: result.sha256Match
+            sha256Match: result.sha256Match,
+            wasCompressed: result.wasCompressed,
+            wasEncrypted: result.wasEncrypted
           });
           
           // 检查是否可以预览
@@ -945,7 +1445,22 @@ const ImgikaTool: React.FC = () => {
           const imageBlob = new Blob([result.originalImageData], { type: 'image/png' });
           downloadBlob(imageBlob, result.outputImageFilename);
           
-          alert(`文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result.originalWidth}x${result.originalHeight})\nSHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}${previewType !== 'none' ?  '\n\n文件可预览，点击下方按钮查看预览' : ''}`);
+          let alertMessage = `文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result.originalWidth}x${result.originalHeight})\n`;
+          
+          if (result.wasCompressed) {
+            alertMessage += `- 数据已解压缩\n`;
+          }
+          if (result.wasEncrypted) {
+            alertMessage += `- 数据已解密\n`;
+          }
+          
+          alertMessage += `SHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}`;
+          
+          if (previewType !== 'none') {
+            alertMessage += '\n\n文件可预览，点击下方按钮查看预览';
+          }
+          
+          alert(alertMessage);
           
           if (! result.sha256Match) {
             console.warn('SHA256校验失败，数据可能已损坏');
@@ -960,16 +1475,105 @@ const ImgikaTool: React.FC = () => {
       
       worker.addEventListener('message', handleMessage);
       
-      // 创建新的 ArrayBuffer 副本
-      const imageDataCopy = imageData.slice().buffer;
-      
       worker.postMessage({
         type: 'decode',
         payload: {
-          imageData: imageDataCopy
+          imageData: imageDataBuffer,
+          password: providedPassword || ''
         }
-      }, [imageDataCopy]);
+      }, [imageDataBuffer]);
     });
+  };
+
+  // 处理密码输入后的解码
+  const handlePasswordSubmit = async (password: string) => {
+    setShowPasswordModal(false);
+    
+    if (!pendingDecodeImageData || !workerRef.current) return;
+    
+    setIsProcessing(true);
+    setProgress(5);
+    
+    const worker = workerRef.current;
+    const imageDataCopy = pendingDecodeImageData.slice(0);
+    
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const handleMessage = (e: MessageEvent) => {
+          const { type, progress: workerProgress, result, error, message } = e.data;
+          
+          if (type === 'progress') {
+            setProgress(workerProgress);
+          } else if (type === 'log') {
+            console.log('Worker:', message);
+          } else if (type === 'decodeResult') {
+            worker.removeEventListener('message', handleMessage);
+            
+            setDecodeResult({
+              fileData: new Uint8Array(result.fileData),
+              originalImageData: new Uint8Array(result.originalImageData),
+              originalDataFilename: result.originalDataFilename,
+              outputImageFilename: result.outputImageFilename,
+              fileSize: result.fileSize,
+              originalWidth: result.originalWidth,
+              originalHeight: result.originalHeight,
+              sha256Match: result.sha256Match,
+              wasCompressed: result.wasCompressed,
+              wasEncrypted: result.wasEncrypted
+            });
+            
+            const previewType = getPreviewType(result.originalDataFilename);
+            if (previewType !== 'none') {
+              setShowPreview(true);
+            }
+            
+            const fileBlob = new Blob([result.fileData]);
+            downloadBlob(fileBlob, result.originalDataFilename);
+            
+            const imageBlob = new Blob([result.originalImageData], { type: 'image/png' });
+            downloadBlob(imageBlob, result.outputImageFilename);
+            
+            let alertMessage = `文件解码成功！\n- 隐藏的文件已下载为 "${result.originalDataFilename}" (${result.fileSize} 字节)\n- 原始图片已下载为 "${result.outputImageFilename}" (${result.originalWidth}x${result.originalHeight})\n`;
+            
+            if (result.wasCompressed) {
+              alertMessage += `- 数据已解压缩\n`;
+            }
+            if (result.wasEncrypted) {
+              alertMessage += `- 数据已解密\n`;
+            }
+            
+            alertMessage += `SHA256校验: ${result.sha256Match ? '通过 ✓' : '失败 ✗'}`;
+            
+            if (previewType !== 'none') {
+              alertMessage += '\n\n文件可预览，点击下方按钮查看预览';
+            }
+            
+            alert(alertMessage);
+            
+            resolve();
+          } else if (type === 'error') {
+            worker.removeEventListener('message', handleMessage);
+            reject(new Error(error));
+          }
+        };
+        
+        worker.addEventListener('message', handleMessage);
+        
+        worker.postMessage({
+          type: 'decode',
+          payload: {
+            imageData: imageDataCopy,
+            password: password
+          }
+        }, [imageDataCopy]);
+      });
+    } catch (error) {
+      console.error('解码失败:', error);
+      alert(`解码失败: ${(error as Error).message}`);
+    } finally {
+      setIsProcessing(false);
+      setPendingDecodeImageData(null);
+    }
   };
 
   const handleDownload = useCallback(() => {
@@ -987,6 +1591,11 @@ const ImgikaTool: React.FC = () => {
     setDataDragActive(false);
     setDecodeResult(null);
     setShowPreview(false);
+    setEnableCompression(false);
+    setEnableEncryption(false);
+    setEncryptionPassword('');
+    setShowPasswordModal(false);
+    setPendingDecodeImageData(null);
     if (processedImageUrlRef.current) {
       URL.revokeObjectURL(processedImageUrlRef.current);
       processedImageUrlRef.current = null;
@@ -1146,6 +1755,94 @@ const ImgikaTool: React.FC = () => {
         )}
       </div>
       
+      {/* 压缩和加密选项（仅编码模式） */}
+      {mode === 'encode' && (
+        <div className="mb-8 bg-[var(--md-sys-color-surface)] p-6 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
+          <h3 className="text-xl font-semibold mb-4 text-[var(--md-sys-color-on-surface)]">
+            3. 高级选项
+          </h3>
+          <div className="space-y-4">
+            {/* 压缩选项 */}
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={enableCompression}
+                  onChange={(e) => setEnableCompression(e.target.checked)}
+                  disabled={isProcessing}
+                  className="w-5 h-5 rounded border-2 border-[var(--md-sys-color-outline)] checked:bg-[var(--md-sys-color-primary)] checked:border-[var(--md-sys-color-primary)] transition-colors cursor-pointer"
+                />
+                <span className="text-[var(--md-sys-color-on-surface)] font-medium">
+                  🗜️ 启用数据压缩
+                </span>
+              </label>
+              <span className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                使用 GZIP 压缩减小数据体积
+              </span>
+            </div>
+            
+            {/* 加密选项 */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={enableEncryption}
+                    onChange={(e) => {
+                      setEnableEncryption(e.target.checked);
+                      if (! e.target.checked) {
+                        setEncryptionPassword('');
+                      }
+                    }}
+                    disabled={isProcessing}
+                    className="w-5 h-5 rounded border-2 border-[var(--md-sys-color-outline)] checked:bg-[var(--md-sys-color-primary)] checked:border-[var(--md-sys-color-primary)] transition-colors cursor-pointer"
+                  />
+                  <span className="text-[var(--md-sys-color-on-surface)] font-medium">
+                    🔐 启用数据加密
+                  </span>
+                </label>
+                <span className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                  使用 AES-256-GCM 加密保护数据
+                </span>
+              </div>
+              
+              {enableEncryption && (
+                <div className="ml-8 relative">
+                  <input
+                    type={showEncryptionPassword ? 'text' : 'password'}
+                    value={encryptionPassword}
+                    onChange={(e) => setEncryptionPassword(e.target.value)}
+                    placeholder="请输入加密密码"
+                    disabled={isProcessing}
+                    className="w-full max-w-md px-4 py-3 pr-12 rounded-xl bg-[var(--md-sys-color-surface-variant)] text-[var(--md-sys-color-on-surface)] border border-[var(--md-sys-color-outline-variant)]/20 focus:outline-none focus:border-[var(--md-sys-color-primary)] disabled:opacity-50"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowEncryptionPassword(!showEncryptionPassword)}
+                    disabled={isProcessing}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--md-sys-color-on-surface-variant)] disabled:opacity-50"
+                  >
+                    {showEncryptionPassword ? '🙈' : '👁️'}
+                  </button>
+                </div>
+              )}
+            </div>
+            
+            {/* 处理顺序说明 */}
+            {(enableCompression || enableEncryption) && (
+              <div className="mt-4 p-4 bg-[var(--md-sys-color-surface-variant)] rounded-xl">
+                <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
+                  <strong>处理顺序：</strong>
+                  {enableCompression && enableEncryption && ' 压缩 → 加密 → 编码'}
+                  {enableCompression && !enableEncryption && ' 压缩 → 编码'}
+                  {! enableCompression && enableEncryption && ' 加密 → 编码'}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      
       {/* 处理按钮 */}
       <div className="flex flex-col items-center">
         <button
@@ -1162,7 +1859,7 @@ const ImgikaTool: React.FC = () => {
               <span className="animate-spin">⟳</span>
               处理中...  {progress}%
             </>
-          ) : mode === 'encode' ? (
+          ) : mode === 'encode' ?  (
             '开始隐藏文件'
           ) : (
             '开始提取文件'
@@ -1197,6 +1894,8 @@ const ImgikaTool: React.FC = () => {
           <div className="bg-[var(--md-sys-color-surface)] p-4 rounded-2xl border border-[var(--md-sys-color-outline-variant)]/20">
             <div className="text-center text-[var(--md-sys-color-on-surface-variant)] mb-4">
               <p>文件大小: {(processedImage.size / 1024 / 1024).toFixed(2)} MB</p>
+              {enableCompression && <p className="text-green-500">✓ 已压缩</p>}
+              {enableEncryption && <p className="text-blue-500">✓ 已加密</p>}
             </div>
             <div className="mt-4 flex justify-center">
               <button
@@ -1228,9 +1927,15 @@ const ImgikaTool: React.FC = () => {
                 <p className="text-sm text-[var(--md-sys-color-on-surface-variant)]">
                   大小: {(decodeResult.fileSize / 1024 / 1024).toFixed(2)} MB ({decodeResult.fileSize} 字节)
                 </p>
-                <p className={`text-sm ${decodeResult.sha256Match ?  'text-green-500' : 'text-red-500'}`}>
+                <p className={`text-sm ${decodeResult.sha256Match ? 'text-green-500' : 'text-red-500'}`}>
                   SHA256校验: {decodeResult.sha256Match ? '通过 ✓' : '失败 ✗'}
                 </p>
+                {decodeResult.wasCompressed && (
+                  <p className="text-sm text-green-500">✓ 数据已解压缩</p>
+                )}
+                {decodeResult.wasEncrypted && (
+                  <p className="text-sm text-blue-500">✓ 数据已解密</p>
+                )}
               </div>
               
               {/* 原始图片信息 */}
@@ -1291,25 +1996,33 @@ const ImgikaTool: React.FC = () => {
           使用说明
         </h3>
         <div className="text-sm text-[var(--md-sys-color-on-surface-variant)] space-y-2">
-          {mode === 'encode' ? (
+          {mode === 'encode' ?  (
             <>
               <p>• <strong>编码模式</strong>：将任意文件隐藏到图片的Alpha通道中</p>
               <p>• 上传一张RGB图片作为载体（支持PNG/JPG/WebP等格式）</p>
-              <p>• 选择要隐藏的文件（任意格式，支持较大文件）</p>
+              <p>• 选择要隐藏的文件（任意格式，支持超大文件）</p>
+              <p>• <strong>压缩功能</strong>：可选启用GZIP压缩，减小数据体积</p>
+              <p>• <strong>加密功能</strong>：可选启用AES-256-GCM加密，保护数据安全</p>
+              <p>• 如果同时启用压缩和加密，将先压缩后加密</p>
               <p>• 处理后会生成一张PNG图片，包含隐藏的数据</p>
-              <p>• 数据格式（Header 1068字节）：</p>
-                            <p className="pl-4">- 0-7字节：文件大小</p>
+              <p>• 数据格式（Header 1092字节）：</p>
+              <p className="pl-4">- 0-7字节：处理后文件大小</p>
               <p className="pl-4">- 8-11字节：原始图片宽度</p>
               <p className="pl-4">- 12-43字节：SHA256校验和</p>
               <p className="pl-4">- 44-555字节：原始图片文件名</p>
               <p className="pl-4">- 556-1067字节：隐藏文件原始文件名</p>
+              <p className="pl-4">- 1068-1071字节：标志位（压缩/加密）</p>
+              <p className="pl-4">- 1072-1079字节：原始文件大小</p>
+              <p className="pl-4">- 1080-1091字节：加密IV</p>
               <p>• 如果原图太小，会自动调整到能容纳数据的最小尺寸（保持宽高比）</p>
-              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持较大文件的快速编码</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 和 OPFS 处理，支持超大文件的编解码，降低内存占用</p>
             </>
           ) : (
             <>
               <p>• <strong>解码模式</strong>：从编码后的图片中提取隐藏的文件</p>
               <p>• 上传使用IMGika编码的PNG图片</p>
+              <p>• 如果数据已加密，会自动弹出密码输入框</p>
+              <p>• 会自动检测并处理压缩和加密的数据</p>
               <p>• 会自动提取并下载隐藏的文件（使用原始文件名）</p>
               <p>• 同时会恢复并下载原始的RGB图片（使用原始文件名）</p>
               <p>• 会自动验证SHA256校验和以确保数据完整性</p>
@@ -1320,7 +2033,7 @@ const ImgikaTool: React.FC = () => {
               <p className="pl-4">- 文本：TXT, MD, LOG, CSV 等</p>
               <p className="pl-4">- 代码：JS, TS, PY, JAVA, C, GO, RS, JSON, HTML, CSS 等</p>
               <p className="pl-4">- 文档：PDF</p>
-              <p>• <strong>优化说明</strong>：使用 Web Worker 处理，支持较大文件的快速解码</p>
+              <p>• <strong>优化说明</strong>：使用 Web Worker 和 OPFS 处理，支持超大文件的编解码，降低内存占用</p>
             </>
           )}
         </div>
@@ -1334,6 +2047,18 @@ const ImgikaTool: React.FC = () => {
           onClose={() => setShowPreview(false)}
         />
       )}
+
+      {/* 密码输入弹窗 */}
+      <PasswordModal
+        isOpen={showPasswordModal}
+        onClose={() => {
+          setShowPasswordModal(false);
+          setPendingDecodeImageData(null);
+        }}
+        onSubmit={handlePasswordSubmit}
+        title="需要密码"
+        description="此图片中的数据已加密，请输入解密密码"
+      />
     </div>
   );
 };
